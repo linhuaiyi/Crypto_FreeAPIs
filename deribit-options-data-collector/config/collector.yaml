@@ -1,0 +1,71 @@
+deribit:
+  base_url: "https://www.deribit.com"
+  ws_url: "wss://www.deribit.com/ws/api/v2"
+  api_key: ""
+  api_secret: ""
+  timeout_seconds: 30
+  max_retries: 3
+  retry_base_delay: 1.0
+  rate_limit:
+    requests_per_second: 20
+    batch_delay_ms: 50
+
+collection:
+  currencies:
+    - BTC
+    - ETH
+  kind: "option"
+  incremental_interval_seconds: 1
+  snapshot_cron: "0 8 * * *"
+  snapshot_depth: 20
+  channels:
+    - ticker
+    - book
+    - trades
+    - markprice
+    - greeks
+
+storage:
+  parquet:
+    base_path: "data/raw/option"
+    compression: "snappy"
+    block_size_mb: 128
+    row_group_size: 100000
+  sqlite:
+    path: "data/deribit_options.db"
+    pool_size: 5
+    timeout: 30
+    check_same_thread: false
+
+metrics:
+  enabled: true
+  port: 9090
+  path: "/metrics"
+  health_port: 8080
+  health_path: "/health"
+  labels:
+    service: "deribit-options-collector"
+    environment: "production"
+
+alerts:
+  pagerduty:
+    enabled: false
+    routing_key: ""
+    severity: "critical"
+  ws_disconnect_threshold_seconds: 30
+  write_failure_threshold: 5
+
+logging:
+  level: "INFO"
+  format: "json"
+  output: "stdout"
+  file_path: ""
+  rotation:
+    max_bytes: 104857600
+    backup_count: 5
+
+whitelist:
+  instruments: []
+  currencies:
+    - BTC
+    - ETH

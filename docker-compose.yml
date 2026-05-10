@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  crypto-collector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: crypto-data-collector
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "3.5"
+          memory: 6G
+        reservations:
+          cpus: "1.0"
+          memory: 2G
+    volumes:
+      - crypto-data:/opt/crypto-data
+      - ./config_strategy.yaml:/app/config_strategy.yaml:ro
+      - ./.env:/app/.env:ro
+    environment:
+      - FRED_API_KEY=${FRED_API_KEY:-}
+      - DATA_DIR=/opt/crypto-data
+      - LOG_DIR=/opt/crypto-data/logs
+      - LOG_LEVEL=INFO
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/opt/crypto-data') else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  crypto-data:
+    driver: local

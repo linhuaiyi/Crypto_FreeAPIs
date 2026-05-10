@@ -1,0 +1,85 @@
+exchanges:
+  binance_spot:
+    enabled: true
+    base_url: "https://api.binance.com/api/v3"
+    rate_limit:
+      requests_per_minute: 2800
+    symbols:
+      BTC: "BTCUSDT"
+      ETH: "ETHUSDT"
+      SOL: "SOLUSDT"
+      BNB: "BNBUSDT"
+      XRP: "XRPUSDT"
+      ADA: "ADAUSDT"
+      DOGE: "DOGEUSDT"
+      SHIB: "SHIBUSDT"
+      PEPE: "PEPEUSDT"
+      WIF: "WIFUSDT"
+      BONK: "BONKUSDT"
+      FLOKI: "FLOKIUSDT"
+      LINK: "LINKUSDT"
+      AVAX: "AVAXUSDT"
+
+  binance_usdm:
+    enabled: true
+    base_url: "https://fapi.binance.com/fapi/v1"
+    rate_limit:
+      requests_per_minute: 100
+    symbols:
+      BTC: "BTCUSDT"
+      ETH: "ETHUSDT"
+      SOL: "SOLUSDT"
+      BNB: "BNBUSDT"
+      XRP: "XRPUSDT"
+      ADA: "ADAUSDT"
+      DOGE: "DOGEUSDT"
+      WIF: "WIFUSDT"
+      LINK: "LINKUSDT"
+      AVAX: "AVAXUSDT"
+
+  deribit:
+    enabled: true
+    base_url: "https://www.deribit.com/api/v2"
+    rate_limit:
+      requests_per_second: 15
+    symbols:
+      BTC: "BTC-PERPETUAL"
+      ETH: "ETH-PERPETUAL"
+      SOL: "SOL-PERPETUAL"
+
+  deribit_options:
+    enabled: true
+    base_url: "https://www.deribit.com/api/v2"
+    rate_limit:
+      requests_per_second: 15
+    option_symbols:
+      BTC: "BTC"
+      ETH: "ETH"
+
+  hyperliquid:
+    enabled: true
+    base_url: "https://api.hyperliquid.xyz"
+    rate_limit:
+      requests_per_minute: 1000
+    symbols:
+      BTC: "BTC"
+      ETH: "ETH"
+      SOL: "SOL"
+      XRP: "XRP"
+      ADA: "ADA"
+      DOGE: "DOGE"
+      WIF: "WIF"
+      LINK: "LINK"
+      AVAX: "AVAX"
+      PEPE: "kPEPE"
+      BONK: "kBONK"
+      SHIB: "kSHIB"
+      FLOKI: "kFLOKI"
+
+global:
+  timeframe: "1d"
+  data_dir: "./data"
+  default_history_days: 365
+  log_level: "INFO"
+  max_retries: 3
+  retry_delay_seconds: 2

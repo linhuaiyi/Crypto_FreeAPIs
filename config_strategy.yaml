@@ -1,0 +1,91 @@
+# config_strategy.yaml - V3.0 Options+Perp Strategy Data System
+
+global:
+  data_dir: "./data"
+  log_level: "INFO"
+
+storage:
+  chunked_buffer:
+    max_rows: 100000
+    max_memory_mb: 200
+    flush_interval_sec: 300
+  compression: "zstd"
+  prune_keep_days: 14
+  prune_data_dir: "/opt/crypto-data"
+
+processors:
+  outlier_filter:
+    z_threshold: 5.0
+    window_size: 100
+  gap_detector:
+    threshold_ms: 60000
+  time_aligner:
+    default_tolerance_ms: 60000
+
+api:
+  binance:
+    base_url_spot: "https://api.binance.com/api/v3"
+    base_url_futures: "https://fapi.binance.com/fapi/v1"
+    ws_url: "wss://fstream.binance.com/ws"
+    rate_limit_rpm: 2800
+  deribit:
+    base_url: "https://www.deribit.com/api/v2"
+    ws_url: "wss://www.deribit.com/ws/api/v2"
+    rate_limit_rps: 20
+    ws_max_channels_per_conn: 300
+    ws_max_connections: 6
+  hyperliquid:
+    base_url: "https://api.hyperliquid.xyz"
+    rate_limit_rpm: 120
+  fred:
+    base_url: "https://api.stlouisfed.org/fred/series/observations"
+    rate_limit_per_hour: 120
+    fallback_rate: 0.05
+    cache_dir: "./cache/fred"
+
+websocket:
+  heartbeat_timeout_sec: 15
+  pong_timeout_sec: 10
+  reconnect_delay_sec: 5
+  max_instruments: 2000
+  gc_interval_sec: 300
+
+risk_free_rate:
+  series:
+    DGS1MO: 0.0833
+    DGS3MO: 0.25
+    DGS6MO: 0.5
+    DGS1: 1.0
+    DGS2: 2.0
+    DGS5: 5.0
+    DGS10: 10.0
+    DGS30: 30.0
+  fallback_rate: 0.05
+
+strategies:
+  short_strangle:
+    priority: "P0"
+    requirements:
+      - data_type: "options_ticker"
+        exchanges: ["deribit"]
+        symbols: ["BTC", "ETH"]
+        frequency: "1s"
+      - data_type: "mark_price"
+        exchanges: ["deribit"]
+        symbols: ["BTC-PERPETUAL", "ETH-PERPETUAL"]
+        frequency: "1s"
+      - data_type: "funding_rate"
+        exchanges: ["binance", "deribit"]
+        symbols: ["BTCUSDT", "BTC-PERPETUAL"]
+        frequency: "8h"
+  synthetic_covered_call:
+    priority: "P0"
+    requirements:
+      - data_type: "options_ticker"
+        exchanges: ["deribit"]
+        symbols: ["BTC", "ETH"]
+        frequency: "1s"
+      - data_type: "funding_rate"
+        exchanges: ["binance", "deribit", "hyperliquid"]
+        symbols: ["BTCUSDT", "BTC-PERPETUAL", "BTC"]
+        frequency: "8h"

@@ -1,0 +1,16 @@
+.env
+.env.*
+__pycache__/
+*.pyc
+.pytest_cache/
+cache/
+data/
+data_stress_test/
+logs/
+*.log
+venv/
+*.egg-info/
+*.parquet
+.claude/
+.coverage
+htmlcov/
