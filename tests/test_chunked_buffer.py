@@ -62,20 +62,18 @@ class TestChunkedBufferAppend:
 
 
 class TestChunkedBufferFlush:
-    def test_flush_creates_hive_partitioned_files(self, tmp_dir):
+    def test_flush_creates_flat_named_files(self, tmp_dir):
         buf = ChunkedBuffer(data_dir=tmp_dir, max_rows=1000)
         df = _make_df(10, start_ts=1700000000000)
         buf.append("deribit", "tickers", "BTC-PERPETUAL", df)
         written = buf.flush_all()
         assert written == 10
 
-        # Verify Hive partition structure
+        # Verify flat file structure: data_dir/exchange/data_type/symbol_date.parquet
         base = os.path.join(tmp_dir, "deribit", "tickers")
-        dates = [d for d in os.listdir(base) if d.startswith("date=")]
-        assert len(dates) >= 1
-        for date_dir in dates:
-            parquet_files = [f for f in os.listdir(os.path.join(base, date_dir)) if f.endswith(".parquet")]
-            assert len(parquet_files) >= 1
+        parquet_files = [f for f in os.listdir(base) if f.endswith(".parquet")]
+        assert len(parquet_files) >= 1
+        assert parquet_files[0].startswith("BTC-PERPETUAL_")
 
     def test_flush_deduplicates(self, tmp_dir):
         buf = ChunkedBuffer(data_dir=tmp_dir, max_rows=1000)
@@ -145,10 +143,10 @@ class TestChunkedBufferPartitioning:
         assert written == 4
 
         base = os.path.join(tmp_dir, "deribit", "tickers")
-        dates = sorted([d for d in os.listdir(base) if d.startswith("date=")])
-        assert len(dates) == 2
+        parquet_files = sorted([f for f in os.listdir(base) if f.endswith(".parquet")])
+        assert len(parquet_files) == 2
 
-    def test_read_parquet_with_partition_filter(self, tmp_dir):
+    def test_read_parquet_by_date(self, tmp_dir):
         buf = ChunkedBuffer(data_dir=tmp_dir, max_rows=1000)
         day1_ts = 1700000000000
         day2_ts = day1_ts + 86400000
@@ -161,10 +159,10 @@ class TestChunkedBufferPartitioning:
         buf.append("deribit", "tickers", "BTC-PERPETUAL", df)
         buf.flush_all()
 
-        # Path: tmp_dir/deribit/tickers/date=YYYY-MM-DD/BTC-PERPETUAL.parquet
+        # Path: tmp_dir/deribit/tickers/BTC-PERPETUAL_YYYY-MM-DD.parquet
         base = os.path.join(tmp_dir, "deribit", "tickers")
         date1_str = datetime.fromtimestamp(day1_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d')
-        fpath = os.path.join(base, f"date={date1_str}", "BTC-PERPETUAL.parquet")
+        fpath = os.path.join(base, f"BTC-PERPETUAL_{date1_str}.parquet")
         assert os.path.exists(fpath)
 
         result = pd.read_parquet(fpath)
@@ -179,13 +177,13 @@ class TestChunkedBufferPartitioning:
 
         import pyarrow.parquet as pq
         base = os.path.join(tmp_dir, "deribit", "tickers")
-        for date_dir in os.listdir(base):
-            if date_dir.startswith("date="):
-                fpath = os.path.join(base, date_dir, "BTC-PERPETUAL.parquet")
-                meta = pq.read_metadata(fpath)
-                for i in range(meta.num_row_groups):
-                    col_meta = meta.row_group(i).column(0)
-                    assert "ZSTD" in str(col_meta.compression).upper()
+        parquet_files = [f for f in os.listdir(base) if f.endswith(".parquet")]
+        assert len(parquet_files) >= 1
+        fpath = os.path.join(base, parquet_files[0])
+        meta = pq.read_metadata(fpath)
+        for i in range(meta.num_row_groups):
+            col_meta = meta.row_group(i).column(0)
+            assert "ZSTD" in str(col_meta.compression).upper()
 
 
 class TestChunkedBufferGetStats:

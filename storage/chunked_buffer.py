@@ -1,13 +1,13 @@
 """
-Chunked buffer for batched Parquet writes with Hive partitioning.
+Chunked buffer for batched Parquet writes with date-based file naming.
 
 Memory-bounded accumulation with triple flush triggers:
   - Row count threshold (default: 100,000 rows)
   - Memory size threshold (default: 200 MB)
   - Time interval threshold (default: 5 minutes)
 
-Output follows Hive partition convention:
-  data/{exchange}/{data_type}/date=YYYY-MM-DD/{symbol}.parquet
+Output path convention:
+  data/{exchange}/{data_type}/{symbol}_{date}.parquet
 """
 
 import os
@@ -30,7 +30,7 @@ _PARQUET_COMPRESSION = "zstd"
 
 
 class ChunkedBuffer:
-    """Memory-bounded buffered writer with Hive-partitioned Parquet output."""
+    """Memory-bounded buffered writer with flat date-named Parquet output."""
 
     def __init__(
         self,
@@ -141,7 +141,10 @@ class ChunkedBuffer:
         return False
 
     def _write_parquet(self, key: str, df: pd.DataFrame) -> int:
-        """Write DataFrame to Hive-partitioned Parquet files."""
+        """Write DataFrame to flat date-named Parquet files.
+
+        Output: data_dir/{exchange}/{data_type}/{symbol}_{date}.parquet
+        """
         if df.empty:
             return 0
 
@@ -161,13 +164,13 @@ class ChunkedBuffer:
 
             parts = key.split("/")
             # parts = [exchange, data_type, symbol]
-            # Hive path: data_dir/exchange/data_type/date=YYYY-MM-DD/symbol.parquet
+            # Flat path: data_dir/exchange/data_type/symbol_YYYY-MM-DD.parquet
             symbol = parts[-1]
             base_parts = parts[:-1]  # [exchange, data_type]
-            dir_path = os.path.join(self.data_dir, *base_parts, f"date={date_str}")
+            dir_path = os.path.join(self.data_dir, *base_parts)
             os.makedirs(dir_path, exist_ok=True)
 
-            file_path = os.path.join(dir_path, f"{symbol}.parquet")
+            file_path = os.path.join(dir_path, f"{symbol}_{date_str}.parquet")
 
             if os.path.exists(file_path):
                 existing = pd.read_parquet(file_path)
@@ -190,7 +193,7 @@ class ChunkedBuffer:
 
             total_written += len(group)
             logger.info(
-                f"[{key}] date={date_str}: wrote {len(group)} rows to {file_path}"
+                f"[{key}] {date_str}: wrote {len(group)} rows to {file_path}"
             )
 
         self._last_flush_time[key] = time.time()
