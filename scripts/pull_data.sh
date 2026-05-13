@@ -12,7 +12,7 @@ set -euo pipefail
 
 REMOTE_HOST="root@217.76.63.39"
 REMOTE_DIR="/opt/Crypto_FreeAPIs/data"
-LOCAL_DIR="./data"
+LOCAL_DIR="./deribit-options-data-collector/data"
 SSH_KEY="$HOME/.ssh/id_rsa"
 SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no"
 

@@ -522,7 +522,9 @@ class SystemLauncher:
         self._buffer: Optional[ChunkedBuffer] = None
         self._monitor: Optional[ResourceMonitor] = None
         self._start_time = 0.0
-        self._data_dir = "./data"
+        self._data_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "deribit-options-data-collector", "data"
+        )
         self._fred_mode = "Fallback (5%)"  # updated during _start_p2_collectors
 
         # Signal Activation shared state (cross-thread data)

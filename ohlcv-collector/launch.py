@@ -1,6 +1,3 @@
-# Deprecated: use ohlcv-collector/launch.py instead
-# This file is kept for backward compatibility.
-
 import argparse
 import time
 import yaml
@@ -9,7 +6,8 @@ import os
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _PROJECT_ROOT)
 
 from fetchers import (
     BinanceSpotFetcher,
@@ -20,12 +18,15 @@ from fetchers import (
 from storage import ParquetStore
 from utils import RateLimiter, get_logger
 
+_SUBPROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 logger = get_logger("Runner", "INFO")
 
 
 class DataPipeline:
-    def __init__(self, config_path: str = "config.yaml"):
+    def __init__(self, config_path: str = None):
+        if config_path is None:
+            config_path = os.path.join(_SUBPROJECT_DIR, "config.yaml")
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
 
@@ -199,7 +200,7 @@ class DataPipeline:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='加密货币 OHLCV 数据采集管线')
+    parser = argparse.ArgumentParser(description='OHLCV 多级别 K 线数据采集管线')
     parser.add_argument(
         '--mode',
         choices=['backfill', 'daily', 'single'],
@@ -211,7 +212,7 @@ def main():
     parser.add_argument('--days', type=int, default=365, help='回填天数')
     parser.add_argument('--timeframe', help='K线周期 (单个)')
     parser.add_argument('--timeframes', help='K线周期 (多个，用逗号分隔，如 1m,15m,30m,1h,4h,1d,1w,1M)')
-    parser.add_argument('--config', default='config.yaml', help='配置文件路径')
+    parser.add_argument('--config', default=None, help='配置文件路径 (默认: ohlcv-collector/config.yaml)')
 
     args = parser.parse_args()
 

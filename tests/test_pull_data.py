@@ -11,6 +11,12 @@ import pytest
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_PATH = os.path.join(PROJECT_ROOT, "scripts", "pull_data.sh")
 MOCK_REMOTE = os.path.join(PROJECT_ROOT, "scripts", "test_remote_data")
+
+# Skip all tests if mock data directory doesn't exist
+pytestmark = pytest.mark.skipif(
+    not os.path.exists(MOCK_REMOTE),
+    reason="Mock remote data not available (scripts/test_remote_data/ missing)",
+)
 LOCAL_DATA = os.path.join(PROJECT_ROOT, "data")
 
 

@@ -1,7 +1,7 @@
 # config_strategy.yaml - V3.0 Options+Perp Strategy Data System
 
 global:
-  data_dir: "./data"
+  data_dir: "./deribit-options-data-collector/data"
   log_level: "INFO"
 
 storage:
