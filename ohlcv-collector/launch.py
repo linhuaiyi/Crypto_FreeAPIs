@@ -148,13 +148,11 @@ class DataPipeline:
                 for unified_symbol in mapping.keys():
                     last_ts = self.store.get_last_timestamp(exchange_name, unified_symbol, tf)
                     if last_ts:
-                        fetch_start = last_ts + 86400 * 1000
-                        logger.info(f"  {unified_symbol}: 已有数据，从 {datetime.fromtimestamp(fetch_start/1000)} 继续")
+                        logger.info(f"  {unified_symbol}: 已有数据至 {datetime.fromtimestamp(last_ts/1000).date()}, 回填从 {datetime.fromtimestamp(start_ms/1000).date()} 开始")
                     else:
-                        fetch_start = start_ms
-                        logger.info(f"  {unified_symbol}: 无数据，从 {datetime.fromtimestamp(fetch_start/1000)} 开始")
+                        logger.info(f"  {unified_symbol}: 无数据，从 {datetime.fromtimestamp(start_ms/1000).date()} 开始")
 
-                    added = self._fetch_symbol(exchange_name, unified_symbol, tf, fetch_start, now_ms)
+                    added = self._fetch_symbol(exchange_name, unified_symbol, tf, start_ms, now_ms)
                     total_added += added
 
                     stats = self.store.get_stats(exchange_name, unified_symbol, tf)
