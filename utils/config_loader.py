@@ -14,13 +14,13 @@ class ConfigLoader:
     _instance: Optional["ConfigLoader"] = None
     _lock = threading.Lock()
 
-    def __init__(self, config_path: str = "config_strategy.yaml") -> None:
+    def __init__(self, config_path: str = "config.yaml") -> None:
         self._config_path = config_path
         self._data: Dict[str, Any] = {}
         self._load()
 
     @classmethod
-    def get(cls, config_path: str = "config_strategy.yaml") -> "ConfigLoader":
+    def get(cls, config_path: str = "config.yaml") -> "ConfigLoader":
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:

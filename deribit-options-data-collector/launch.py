@@ -30,6 +30,7 @@ import pandas as pd
 
 # ── sys.path 预处理: 导入父目录的 V3.0 模块 ──
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_SUBPROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
@@ -565,7 +566,7 @@ class SystemLauncher:
 
     def _print_banner(self) -> None:
         config = ConfigLoader.get(
-            os.path.join(_PROJECT_ROOT, "config_strategy.yaml")
+            os.path.join(_SUBPROJECT_DIR, "config_strategy.yaml")
         )
         data_dir = config.get_value("global", "data_dir", default="./data")
         fred_key = os.environ.get("FRED_API_KEY", "")
@@ -590,7 +591,7 @@ class SystemLauncher:
     def _init_storage(self) -> None:
         """Phase 0: 初始化 ChunkedBuffer 并启动定时 flush。"""
         config = ConfigLoader.get(
-            os.path.join(_PROJECT_ROOT, "config_strategy.yaml")
+            os.path.join(_SUBPROJECT_DIR, "config_strategy.yaml")
         )
         data_dir = config.get_value("global", "data_dir", default="./data")
         max_rows = config.get_value("storage", "chunked_buffer", "max_rows", default=100_000)
@@ -804,7 +805,7 @@ class SystemLauncher:
 
         fred_key = os.environ.get("FRED_API_KEY", "")
         config = ConfigLoader.get(
-            os.path.join(_PROJECT_ROOT, "config_strategy.yaml")
+            os.path.join(_SUBPROJECT_DIR, "config_strategy.yaml")
         )
         fallback = config.get_value("risk_free_rate", "fallback_rate", default=0.05)
 
@@ -863,7 +864,7 @@ class SystemLauncher:
         """启动资源监控哨兵。"""
         keep_days = DEFAULT_PRUNE_KEEP_DAYS
         config = ConfigLoader.get(
-            os.path.join(_PROJECT_ROOT, "config_strategy.yaml")
+            os.path.join(_SUBPROJECT_DIR, "config_strategy.yaml")
         )
         keep_days = config.get_value(
             "storage", "prune_keep_days", default=DEFAULT_PRUNE_KEEP_DAYS
@@ -947,7 +948,7 @@ class SystemLauncher:
     def _run_data_audit(self) -> None:
         """在 flush 完成后对落盘数据做完整性审计。"""
         config = ConfigLoader.get(
-            os.path.join(_PROJECT_ROOT, "config_strategy.yaml")
+            os.path.join(_SUBPROJECT_DIR, "config_strategy.yaml")
         )
         data_dir = config.get_value("global", "data_dir", default="./data")
 
