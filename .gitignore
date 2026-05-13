@@ -14,3 +14,5 @@ venv/
 .claude/
 .coverage
 htmlcov/
+ohlcv-collector/data/
+deribit-options-data-collector/data/
