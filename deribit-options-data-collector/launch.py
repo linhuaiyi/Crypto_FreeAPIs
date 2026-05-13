@@ -59,7 +59,7 @@ from utils import get_logger
 from utils.config_loader import ConfigLoader
 
 # LOG_DIR 环境变量 — RotatingFileHandler 会自动使用
-os.environ.setdefault("LOG_DIR", os.path.join(_PROJECT_ROOT, "logs"))
+os.environ.setdefault("LOG_DIR", os.path.join(_SUBPROJECT_DIR, "logs"))
 
 try:
     import psutil
@@ -1017,7 +1017,7 @@ class SystemLauncher:
         print("=" * 60)
 
         # Persist to logs/last_audit.md
-        log_dir = os.environ.get("LOG_DIR", os.path.join(_PROJECT_ROOT, "logs"))
+        log_dir = os.environ.get("LOG_DIR", os.path.join(_SUBPROJECT_DIR, "logs"))
         os.makedirs(log_dir, exist_ok=True)
         audit_path = os.path.join(log_dir, "last_audit.md")
 

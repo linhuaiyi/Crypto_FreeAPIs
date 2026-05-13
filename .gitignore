@@ -16,3 +16,4 @@ venv/
 htmlcov/
 ohlcv-collector/data/
 deribit-options-data-collector/data/
+deribit-options-data-collector/logs/
