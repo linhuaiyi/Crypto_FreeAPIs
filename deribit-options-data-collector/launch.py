@@ -54,6 +54,7 @@ from fetchers.binance_spot_fetcher import BinanceSpotPriceFetcher
 from processors.greeks_processor import GreeksProcessor, DeribitOptionsChainFetcher
 from processors.basis_calculator import BasisCalculator, BasisPoint
 from processors.vol_surface import VolatilitySurfaceBuilder
+from processors.iv_rank import IVRankTracker
 from pipeline.strategy_configs import get_all_strategies, StrategyConfig, DataRequirement
 from utils import get_logger
 from utils.config_loader import ConfigLoader
@@ -308,6 +309,7 @@ class BasisVolProcessorThread(CollectorThread):
         shutdown_event: threading.Event,
         shared_state: Dict,
         state_lock: threading.Lock,
+        data_dir: str,
     ) -> None:
         super().__init__("BasisVol", "P1", shutdown_event)
         self._buffer = buffer
@@ -315,6 +317,22 @@ class BasisVolProcessorThread(CollectorThread):
         self._state_lock = state_lock
         self._basis_calc = BasisCalculator()
         self._vol_builder = VolatilitySurfaceBuilder()
+
+        # Per-currency IV rank trackers, bootstrapped from existing parquet
+        # so the first tick after restart already has a real baseline.
+        # A state file outside data/ survives pull_data.sh cleanups and
+        # gives the tracker a baseline even after remote-restart wipes.
+        abs_data_dir = os.path.abspath(data_dir)
+        state_dir = os.path.join(_SUBPROJECT_DIR, "state")
+        self._iv_trackers: Dict[str, IVRankTracker] = {
+            sym: IVRankTracker(
+                sym,
+                state_file=os.path.join(state_dir, f"iv_rank_{sym}.json"),
+            )
+            for sym in ("BTC", "ETH")
+        }
+        for tracker in self._iv_trackers.values():
+            tracker.bootstrap_from_parquet(abs_data_dir)
 
     def run(self) -> None:
         logger.info("[BasisVol] 启动，计算间隔 10s")
@@ -327,6 +345,14 @@ class BasisVolProcessorThread(CollectorThread):
                 logger.warning(f"[BasisVol] 计算异常: {e}")
 
             self._shutdown.wait(BASIS_VOL_INTERVAL_SEC)
+
+        # Persist IV rank state so the next process restart can bootstrap
+        # without losing the in-memory baseline.
+        for tracker in self._iv_trackers.values():
+            try:
+                tracker.save_state()
+            except Exception as e:
+                logger.warning(f"[BasisVol] save IV rank state failed: {e}")
 
         logger.info("[BasisVol] 退出")
 
@@ -394,9 +420,19 @@ class BasisVolProcessorThread(CollectorThread):
                 })
                 underlying = float(subset["underlying_price"].iloc[0])
 
+                tracker = self._iv_trackers[currency]
+                historical_ivs = tracker.historical_ivs()
+
                 point = self._vol_builder.build_surface(
-                    options_df, underlying, symbol=currency,
+                    options_df, underlying,
+                    historical_ivs=historical_ivs,
+                    symbol=currency,
                 )
+
+                # Feed this tick's atm_iv into the tracker so future days
+                # include it in their baseline. Called AFTER rank computation
+                # so the current day never ranks against itself.
+                tracker.update(point.timestamp, point.atm_iv)
 
                 import numpy as np
                 row = {
@@ -793,6 +829,7 @@ class SystemLauncher:
             shutdown_event=self._shutdown_event,
             shared_state=self._shared_state,
             state_lock=self._state_lock,
+            data_dir=self._data_dir,
         )
         basis_vol_thread.start()
         self._collectors.append(basis_vol_thread)

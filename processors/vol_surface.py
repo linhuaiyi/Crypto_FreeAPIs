@@ -151,15 +151,14 @@ class VolatilitySurfaceBuilder:
         return term_structure
 
     def compute_iv_rank(self, current_iv: float, historical_ivs: pd.Series) -> float:
-        """Percentile rank of *current_iv* within *historical_ivs* (0-100)."""
-        if historical_ivs.empty:
-            logger.warning("Empty historical IV series passed to compute_iv_rank")
-            return 50.0
+        """Percentile rank of *current_iv* within *historical_ivs* (0-100).
 
-        count_below = int((historical_ivs <= current_iv).sum())
-        iv_rank = (count_below / len(historical_ivs)) * 100.0
-        logger.debug("IV rank=%.1f (current_iv=%.4f)", iv_rank, current_iv)
-        return iv_rank
+        Delegates to ``processors.iv_rank.compute_rank`` so the collector,
+        live process, and tests share one implementation.
+        """
+        from processors.iv_rank import compute_rank
+
+        return compute_rank(current_iv, historical_ivs)
 
     def build_surface(
         self,
