@@ -18,3 +18,6 @@ ohlcv-collector/data/
 deribit-options-data-collector/data/
 deribit-options-data-collector/logs/
 deribit-options-data-collector/state/
+ohlcv-collector/state/
+binance-data-collector/cache/
+.vscode/

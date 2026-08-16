@@ -1,0 +1,20 @@
+# 容器镜像只需要 V3.0 运行时: 共享库 + deribit launch.py + 配置
+.git
+.venv
+venv
+docs
+tests
+_external
+.claude
+.vscode
+.trae
+**/legacy_v1/
+**/__pycache__/
+**/data/
+**/logs/
+**/cache/
+**/state/
+**/*.zip
+.env
+*.log
+*.parquet
