@@ -29,6 +29,15 @@ def _ws_is_closed(ws) -> bool:
         return ws.state >= State.CLOSING
     return True
 
+
+def _maybe_float(d: dict, key: str) -> Optional[float]:
+    """Return float(d[key]) when present and non-null, else None."""
+    v = d.get(key)
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
 HEARTBEAT_TIMEOUT_SEC = 30
 RECONNECT_DELAY_SEC = 5
 APP_HEARTBEAT_CHECK_SEC = 15
@@ -38,7 +47,13 @@ GC_INTERVAL_SEC = 300
 
 @dataclass
 class L1Quote:
-    """Best bid/ask snapshot for a single instrument."""
+    """Best bid/ask snapshot for a single instrument.
+
+    IV fields (``mark_iv``/``bid_iv``/``ask_iv``) are populated only when the
+    instrument is subscribed via the ``ticker.{instrument}`` channel (which
+    carries them). ``quote.{instrument}`` subscriptions leave them ``None`` —
+    quote carries only prices/amounts, no IV.
+    """
     timestamp: int  # ms
     instrument_name: str
     bid_price: float
@@ -46,6 +61,15 @@ class L1Quote:
     bid_size: float
     ask_size: float
     last_price: float = 0.0
+    mark_iv: Optional[float] = None
+    bid_iv: Optional[float] = None
+    ask_iv: Optional[float] = None
+    # Deribit-published greeks (ticker payload only); None for quote-only subs.
+    deribit_delta: Optional[float] = None
+    deribit_gamma: Optional[float] = None
+    deribit_vega: Optional[float] = None
+    deribit_theta: Optional[float] = None
+    deribit_rho: Optional[float] = None
 
 
 class WSOrderbookEngine:
@@ -164,6 +188,53 @@ class WSOrderbookEngine:
                 out[name] = (q.bid_size, q.ask_size)
         return out
 
+    def get_ivs(
+        self,
+        instrument_names: List[str],
+        max_stale_sec: float = 300.0,
+    ) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
+        """Batch lookup of ``(bid_iv, ask_iv, mark_iv)``.
+
+        Only instruments subscribed via ``ticker.{instrument}`` carry IV data;
+        ``quote.{instrument}`` subscriptions yield no entry here. Stale quotes
+        (older than ``max_stale_sec``) and entries without IV are skipped.
+        """
+        cutoff_ms = (time.time() - max_stale_sec) * 1000
+        out: Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]] = {}
+        for name in instrument_names:
+            q = self._state.get(name)
+            if q is None or q.timestamp < cutoff_ms:
+                continue
+            if q.mark_iv is None and q.bid_iv is None and q.ask_iv is None:
+                continue
+            out[name] = (q.bid_iv, q.ask_iv, q.mark_iv)
+        return out
+
+    def get_deribit_greeks(
+        self,
+        instrument_names: List[str],
+        max_stale_sec: float = 300.0,
+    ) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float],
+                         Optional[float], Optional[float]]]:
+        """Batch lookup of Deribit-published ``(delta, gamma, vega, theta, rho)``.
+
+        Only ``ticker.{instrument}`` subscriptions carry Deribit's greeks;
+        ``quote.{instrument}`` subscriptions yield no entry here. Stored
+        alongside our BS-computed greeks for cross-validation.
+        """
+        cutoff_ms = (time.time() - max_stale_sec) * 1000
+        out: Dict[str, Tuple[Optional[float], Optional[float], Optional[float],
+                             Optional[float], Optional[float]]] = {}
+        for name in instrument_names:
+            q = self._state.get(name)
+            if q is None or q.timestamp < cutoff_ms:
+                continue
+            if q.deribit_delta is None and q.deribit_gamma is None:
+                continue
+            out[name] = (q.deribit_delta, q.deribit_gamma, q.deribit_vega,
+                         q.deribit_theta, q.deribit_rho)
+        return out
+
     def stop(self) -> None:
         """Signal shutdown and clear state."""
         self._running = False
@@ -206,9 +277,7 @@ class WSOrderbookEngine:
                     url,
                     ping_interval=None,  # we handle heartbeats ourselves
                     ping_timeout=None,
-                    # 不得调大: Deribit 服务端对批量订阅强制 ~32KB 上限 (实测 ≥1200
-                    # channels/conn 即断连), 正确做法是拆分到多个连接 (见 T4 4-conn pool)
-                    max_size=2**22,
+                    max_size=2**24,  # 16 MiB; Deribit's batched quote snapshots for ~1600+ options exceed 4 MiB
                 ) as ws:
                     self._ws = ws
                     await self._send_subscriptions(ws)
@@ -382,13 +451,27 @@ class WSOrderbookEngine:
             return
 
         quote = L1Quote(
-            timestamp=int(data.get("timestamp", time.time() * 1000)),
+            timestamp=int(data.get("timestamp") or (time.time() * 1000)),
             instrument_name=instrument,
-            bid_price=float(data.get("best_bid_price", 0)),
-            ask_price=float(data.get("best_ask_price", 0)),
-            bid_size=float(data.get("best_bid_amount", 0)),
-            ask_size=float(data.get("best_ask_amount", 0)),
-            last_price=float(data.get("last_price", 0)),
+            # ticker payloads carry null when a side is absent; guard with
+            # _maybe_float (None -> 0.0 for prices/amounts).
+            bid_price=_maybe_float(data, "best_bid_price") or 0.0,
+            ask_price=_maybe_float(data, "best_ask_price") or 0.0,
+            bid_size=_maybe_float(data, "best_bid_amount") or 0.0,
+            ask_size=_maybe_float(data, "best_ask_amount") or 0.0,
+            last_price=_maybe_float(data, "last_price") or 0.0,
+            # IV fields only present on `ticker.{instrument}` payloads;
+            # `quote.{instrument}` omits them -> None.
+            mark_iv=_maybe_float(data, "mark_iv"),
+            bid_iv=_maybe_float(data, "bid_iv"),
+            ask_iv=_maybe_float(data, "ask_iv"),
+            # Deribit-published greeks (ticker payload carries a `greeks` dict;
+            # quote payload omits it -> all None).
+            deribit_delta=_maybe_float(data.get("greeks") or {}, "delta"),
+            deribit_gamma=_maybe_float(data.get("greeks") or {}, "gamma"),
+            deribit_vega=_maybe_float(data.get("greeks") or {}, "vega"),
+            deribit_theta=_maybe_float(data.get("greeks") or {}, "theta"),
+            deribit_rho=_maybe_float(data.get("greeks") or {}, "rho"),
         )
 
         self._state[instrument] = quote

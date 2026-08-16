@@ -1,0 +1,103 @@
+{
+  "mode": "longrun",
+  "config": {
+    "connections": 4,
+    "duration_sec": 1800,
+    "channel_type": "quote",
+    "total_instruments": 1548
+  },
+  "results": [
+    {
+      "name": "conn0",
+      "elapsed_sec": 1810.3,
+      "channels_subscribed": 387,
+      "messages_received": 26025,
+      "bytes_received": 6710435,
+      "bytes_received_mb": 6.4,
+      "max_message_bytes": 10822,
+      "max_message_mb": 0.01,
+      "msg_per_sec": 14.4,
+      "first_msg_latency_sec": 1.06,
+      "instruments_seen": 387,
+      "instruments_seen_pct": 100.0,
+      "size_buckets": {
+        "10-100KB": 1,
+        "<1KB": 26024
+      },
+      "close_code": null,
+      "close_reason": null,
+      "heartbeat_failures": 0,
+      "subscribe_response_success": true,
+      "errors": []
+    },
+    {
+      "name": "conn1",
+      "elapsed_sec": 1810.3,
+      "channels_subscribed": 387,
+      "messages_received": 31922,
+      "bytes_received": 8215614,
+      "bytes_received_mb": 7.84,
+      "max_message_bytes": 10822,
+      "max_message_mb": 0.01,
+      "msg_per_sec": 17.6,
+      "first_msg_latency_sec": 1.04,
+      "instruments_seen": 387,
+      "instruments_seen_pct": 100.0,
+      "size_buckets": {
+        "10-100KB": 1,
+        "<1KB": 31921
+      },
+      "close_code": null,
+      "close_reason": null,
+      "heartbeat_failures": 0,
+      "subscribe_response_success": true,
+      "errors": []
+    },
+    {
+      "name": "conn2",
+      "elapsed_sec": 1800.5,
+      "channels_subscribed": 387,
+      "messages_received": 25630,
+      "bytes_received": 6603518,
+      "bytes_received_mb": 6.3,
+      "max_message_bytes": 10825,
+      "max_message_mb": 0.01,
+      "msg_per_sec": 14.2,
+      "first_msg_latency_sec": 1.05,
+      "instruments_seen": 387,
+      "instruments_seen_pct": 100.0,
+      "size_buckets": {
+        "10-100KB": 1,
+        "<1KB": 25629
+      },
+      "close_code": null,
+      "close_reason": null,
+      "heartbeat_failures": 0,
+      "subscribe_response_success": true,
+      "errors": []
+    },
+    {
+      "name": "conn3",
+      "elapsed_sec": 1810.3,
+      "channels_subscribed": 387,
+      "messages_received": 30461,
+      "bytes_received": 7836604,
+      "bytes_received_mb": 7.47,
+      "max_message_bytes": 10825,
+      "max_message_mb": 0.01,
+      "msg_per_sec": 16.8,
+      "first_msg_latency_sec": 1.3,
+      "instruments_seen": 387,
+      "instruments_seen_pct": 100.0,
+      "size_buckets": {
+        "10-100KB": 1,
+        "<1KB": 30460
+      },
+      "close_code": null,
+      "close_reason": null,
+      "heartbeat_failures": 0,
+      "subscribe_response_success": true,
+      "errors": []
+    }
+  ]
+}

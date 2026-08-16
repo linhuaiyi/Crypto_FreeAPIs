@@ -1,0 +1,10 @@
+data/
+logs/
+cache/
+__pycache__/
+*.pyc
+*.parquet
+*.log
+*.log.*
+*.zip
+.env

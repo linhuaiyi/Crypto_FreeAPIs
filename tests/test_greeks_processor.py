@@ -71,9 +71,10 @@ def _make_chain_item(
     ask_price=5200.0,
     mid_price=5100.0,
     underlying_price=103000.0,
-    mark_iv=0.65,
-    bid_iv=0.63,
-    ask_iv=0.67,
+    # Deribit API 返回的 IV 为百分数 (65.0 = 65%), compute_batch 内部 /100 转小数
+    mark_iv=65.0,
+    bid_iv=63.0,
+    ask_iv=67.0,
 ):
     return {
         "instrument_name": instrument_name,
@@ -99,7 +100,7 @@ class TestGreeksProcessorComputeBatch:
         expiry = self._future_expiry_str()
         chain = [_make_chain_item(
             instrument_name=f"BTC-{expiry}-100000-C",
-            mark_iv=0.65,
+            mark_iv=65.0,
             underlying_price=103000.0,
         )]
         proc = GreeksProcessor()
@@ -117,7 +118,7 @@ class TestGreeksProcessorComputeBatch:
         expiry = self._future_expiry_str()
         chain = [_make_chain_item(
             instrument_name=f"BTC-{expiry}-100000-P",
-            mark_iv=0.65,
+            mark_iv=65.0,
             underlying_price=103000.0,
         )]
         proc = GreeksProcessor()
@@ -158,9 +159,9 @@ class TestGreeksProcessorComputeBatch:
     def test_multiple_instruments(self):
         expiry = self._future_expiry_str()
         chain = [
-            _make_chain_item(instrument_name=f"BTC-{expiry}-100000-C", mark_iv=0.65),
-            _make_chain_item(instrument_name=f"BTC-{expiry}-105000-C", mark_iv=0.60),
-            _make_chain_item(instrument_name=f"BTC-{expiry}-95000-P", mark_iv=0.70),
+            _make_chain_item(instrument_name=f"BTC-{expiry}-100000-C", mark_iv=65.0),
+            _make_chain_item(instrument_name=f"BTC-{expiry}-105000-C", mark_iv=60.0),
+            _make_chain_item(instrument_name=f"BTC-{expiry}-95000-P", mark_iv=70.0),
         ]
         proc = GreeksProcessor()
         result = proc.compute_batch(chain)

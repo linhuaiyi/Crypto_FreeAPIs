@@ -158,6 +158,8 @@ class TestChunkedBufferPartitioning:
         })
         buf.append("deribit", "tickers", "BTC-PERPETUAL", df)
         buf.flush_all()
+        # append-only 写入器: 需收尾 footer 后文件才可读 (生产中在优雅退出时调用)
+        buf.close_all_writers()
 
         # Path: tmp_dir/deribit/tickers/BTC-PERPETUAL_YYYY-MM-DD.parquet
         base = os.path.join(tmp_dir, "deribit", "tickers")
@@ -174,6 +176,7 @@ class TestChunkedBufferPartitioning:
         df = _make_df(50)
         buf.append("deribit", "tickers", "BTC-PERPETUAL", df)
         buf.flush_all()
+        buf.close_all_writers()  # 收尾 footer 后才可读
 
         import pyarrow.parquet as pq
         base = os.path.join(tmp_dir, "deribit", "tickers")

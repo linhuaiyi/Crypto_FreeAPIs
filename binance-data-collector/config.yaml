@@ -1,0 +1,37 @@
+# binance-data-collector — Phase 1+2 (spot/perp/mark/index/funding)
+# See docs/binance/STRATEGY_DATA_REQUIREMENTS_BINANCE.md for the strategy context.
+
+global:
+  data_dir: "./binance-data-collector/data"
+  log_level: "INFO"
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+  interval: "1m"
+  history_days: 90
+
+api:
+  vision_base: "https://data.binance.vision"
+  http_timeout_sec: 60
+  max_retries: 3
+  inter_request_delay_ms: 50   # CDN politeness delay
+
+storage:
+  chunked_buffer:
+    max_rows: 200000
+    max_memory_mb: 400
+    flush_interval_sec: 60
+  compression: "zstd"
+
+# Each data_type maps to a fetcher. 'enabled' = include in backfill / daily runs.
+data_types:
+  spot_klines:   {enabled: true}
+  perp_klines:   {enabled: true}
+  mark_klines:   {enabled: true}
+  index_klines:  {enabled: true}
+  funding_rate:  {enabled: true}
+
+verify:
+  expected_points_per_day_1m: 1440
+  max_gap_minutes: 5
+  min_completeness_ratio: 0.90

@@ -21,21 +21,23 @@ WORKDIR /app
 COPY --from=builder /install /usr/local
 COPY . .
 
-# Data volume for Parquet files
-VOLUME /opt/crypto-data
-
+# V3.0 launch.py 从 config_strategy.yaml 读 data_dir="./data" (相对 CWD=/app),
+# 数据实际落点 /app/data; volume 必须挂在这里而非自定义路径
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
-ENV DATA_DIR=/opt/crypto-data
-ENV LOG_DIR=/opt/crypto-data/logs
+ENV LOG_DIR=/app/data/logs
 
-# Non-root user for security
-RUN groupadd -r collector && useradd -r -g collector -d /app collector && \
-    chown -R collector:collector /app /opt/crypto-data
+# Non-root user for security; VOLUME 不会在 build 期创建目录, 需显式 mkdir
+RUN mkdir -p /app/data/logs && \
+    groupadd -r collector && useradd -r -g collector -d /app collector && \
+    chown -R collector:collector /app
 USER collector
 
+VOLUME /app/data
+
+# test 模式 60s 自退出; live 模式无 HTTP 健康端点, 用进程存活检查
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD pgrep -f "deribit-options-data-collector/launch.py" >/dev/null || exit 1
 
 ENTRYPOINT ["python", "deribit-options-data-collector/launch.py", "--mode", "live"]
 CMD ["--strategies", "all"]

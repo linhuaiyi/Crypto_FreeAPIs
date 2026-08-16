@@ -1,14 +1,13 @@
 """
 V3.0 Data Collection Verification Script.
 
-Auto-discovers all Hive-partitioned parquet data under data/{exchange}/{data_type}/date=*/{symbol}.parquet,
+Auto-discovers all flat-named parquet data under data/{exchange}/{data_type}/{symbol}_{date}.parquet,
 verifies completeness/continuity/correctness via streaming (no OOM).
-Also reports legacy V1/V2 flat parquet files.
 
 Usage:
-    python scripts/verify_collected_data.py
-    python scripts/verify_collected_data.py --data-dir ./data
-    python scripts/verify_collected_data.py --log logs/collector.log
+    python scripts/verify_collected_data.py --data-dir ./deribit-options-data-collector/data
+    python scripts/verify_collected_data.py --data-dir ./deribit-options-data-collector/data --log ./deribit-options-data-collector/logs/collector.log
+    python scripts/verify_collected_data.py --data-dir ./deribit-options-data-collector/data --no-log
 """
 
 from __future__ import annotations
@@ -16,7 +15,6 @@ from __future__ import annotations
 import argparse
 import glob
 import os
-import re
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -37,7 +35,6 @@ logger = get_logger("DataVerify")
 
 _LARGE_FILE_ROWS = 100_000
 _V3_EXCHANGES = {"binance", "deribit", "hyperliquid", "fred"}
-_V3_DATE_RE = re.compile(r"date=(\d{4}-\d{2}-\d{2})$")
 
 
 # ── Data classes ──
@@ -103,8 +100,8 @@ def check_parquet_file(filepath: str) -> FileCheck:
     errors: List[str] = []
     null_warnings: List[str] = []
 
-    if "date=1970" in filepath.replace("\\", "/"):
-        errors.append("date=1970-01-01 partition — epoch-zero timestamp")
+    if "1970-01-01" in filepath.replace("\\", "/"):
+        errors.append("epoch-zero date in filename")
 
     size_kb = os.path.getsize(filepath) / 1024.0
 
@@ -263,18 +260,26 @@ def compute_coverage(files: List[str], expected_sec: float, is_multi_instrument:
 # ── Auto-discovery of V3.0 sources ──
 
 def discover_v3_sources(data_dir: str) -> Dict[Tuple[str, str, str], List[str]]:
-    """Discover {exchange}/{data_type}/date=*/{symbol}.parquet → files mapping."""
+    """Discover {exchange}/{data_type}/{symbol}_{date}.parquet → files mapping."""
     sources: Dict[Tuple[str, str, str], List[str]] = defaultdict(list)
     for exchange in _V3_EXCHANGES:
         base = os.path.join(data_dir, exchange)
         if not os.path.isdir(base):
             continue
-        for date_dir in sorted(glob.glob(os.path.join(base, "*", "date=*"))):
-            if not _V3_DATE_RE.search(os.path.basename(date_dir)):
+        for dtype_dir in sorted(glob.glob(os.path.join(base, "*"))):
+            if not os.path.isdir(dtype_dir):
                 continue
-            data_type = os.path.basename(os.path.dirname(date_dir))
-            for pf in glob.glob(os.path.join(date_dir, "*.parquet")):
-                symbol = os.path.splitext(os.path.basename(pf))[0]
+            data_type = os.path.basename(dtype_dir)
+            for pf in sorted(glob.glob(os.path.join(dtype_dir, "*.parquet"))):
+                fname = os.path.basename(pf)
+                # Extract symbol: filename is {symbol}_{YYYY-MM-DD}.parquet
+                name_without_ext = os.path.splitext(fname)[0]
+                # Find last _YYYY-MM-DD pattern
+                parts = name_without_ext.rsplit("_", 1)
+                if len(parts) == 2 and len(parts[1]) == 10 and parts[1][4] == "-":
+                    symbol = parts[0]
+                else:
+                    symbol = name_without_ext
                 sources[(exchange, data_type, symbol)].append(pf)
     return sources
 
@@ -288,7 +293,6 @@ def verify_log_file(log_path: str) -> Dict:
     errors, warnings = [], []
     greeks_stats: Dict[str, int] = {}
     vol_surface_stats: Dict[str, int] = {}
-    date_1970_flushes: List[str] = []
 
     with open(log_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -297,9 +301,6 @@ def verify_log_file(log_path: str) -> Dict:
                 warnings.append(line)
             elif "ERROR" in line or ("Exception" in line and "Traceback" not in line):
                 errors.append(line)
-            elif "wrote" in line and "rows" in line:
-                if "date=1970" in line:
-                    date_1970_flushes.append(line)
             elif "computed" in line and "Greeks" in line:
                 for cur in ["BTC", "ETH"]:
                     if f" {cur} " in line:
@@ -316,7 +317,6 @@ def verify_log_file(log_path: str) -> Dict:
         "error_count": len(errors), "warning_count": len(warnings),
         "errors": errors[:20], "warnings": warnings[:20],
         "greeks_stats": greeks_stats, "vol_surface_stats": vol_surface_stats,
-        "date_1970_flushes": date_1970_flushes,
     }
 
 
@@ -339,8 +339,225 @@ _SOURCE_INTERVALS = {
 
 _MULTI_INSTRUMENT = {("deribit", "options_greeks")}
 
+_PRICE_COLS = ["mark_price", "price", "mid_price", "bid_price", "ask_price", "underlying_price"]
 
-# ── Report helpers ──
+
+# ── Date boundary check (runbook 3.2) ──
+
+def check_date_boundaries(
+    sources: Dict[Tuple[str, str, str], List[str]],
+) -> List[str]:
+    """Verify each file only contains data from its expected date (UTC)."""
+    issues: List[str] = []
+    for (exchange, data_type, symbol), files in sorted(sources.items()):
+        for fp in sorted(files):
+            fname = os.path.basename(fp)
+            parts = os.path.splitext(fname)[0].rsplit("_", 1)
+            if len(parts) != 2 or len(parts[1]) != 10 or parts[1][4] != "-":
+                continue
+            expected_date = parts[1]
+            try:
+                pf = pq.ParquetFile(fp)
+                if "timestamp" not in pf.schema_arrow.names or pf.metadata.num_rows == 0:
+                    continue
+                first_rg = pf.read_row_group(0, columns=["timestamp"])
+                first_ts = first_rg.column("timestamp")[0].as_py()
+                last_idx = pf.metadata.num_row_groups - 1
+                last_rg = pf.read_row_group(last_idx, columns=["timestamp"])
+                last_ts = last_rg.column("timestamp")[-1].as_py()
+                from datetime import datetime, timezone
+                for ts_val in [first_ts, last_ts]:
+                    actual = datetime.fromtimestamp(ts_val / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+                    if actual != expected_date:
+                        rel = f"{exchange}/{data_type}/{fname}"
+                        issues.append(f"DATE MISMATCH: {rel} expected {expected_date}, got {actual}")
+                        break
+            except Exception:
+                pass
+    return issues
+
+
+# ── Value range sanity (runbook 3.3) ──
+
+def check_value_ranges(
+    sources: Dict[Tuple[str, str, str], List[str]],
+) -> List[str]:
+    """Check price positivity, IV bounds, extreme funding, negative spread."""
+    issues: List[str] = []
+    for (exchange, data_type, symbol), files in sorted(sources.items()):
+        for fp in sorted(files):
+            try:
+                pf = pq.ParquetFile(fp)
+                rows = pf.metadata.num_rows
+                if rows == 0:
+                    continue
+                cols = set(pf.schema_arrow.names)
+
+                # Decide which columns to read
+                price_cols = [c for c in _PRICE_COLS if c in cols]
+                iv_col = ["iv"] if "iv" in cols else []
+                fr_col = ["funding_rate"] if "funding_rate" in cols else []
+                sp_col = ["spread"] if "spread" in cols else []
+                read_cols = price_cols + iv_col + fr_col + sp_col
+                if not read_cols:
+                    continue
+
+                # Sample for large files
+                if rows > _LARGE_FILE_ROWS:
+                    rg_count = pf.metadata.num_row_groups
+                    sample_rgs = list({0, rg_count // 2, rg_count - 1})
+                    chunks = []
+                    for ri in sample_rgs:
+                        try:
+                            chunks.append(pf.read_row_group(ri, columns=read_cols).to_pandas())
+                        except Exception:
+                            continue
+                    if not chunks:
+                        continue
+                    df = pd.concat(chunks, ignore_index=True)
+                else:
+                    df = pf.read(columns=read_cols).to_pandas()
+
+                rel = f"{exchange}/{data_type}/{os.path.basename(fp)}"
+                suffix = " (sampled)" if rows > _LARGE_FILE_ROWS else ""
+
+                for col in price_cols:
+                    bad = (df[col] <= 0).sum()
+                    if bad:
+                        issues.append(f"NON-POSITIVE {col}: {rel} -> {bad} rows{suffix}")
+
+                if "iv" in df.columns:
+                    bad = ((df["iv"] <= 0) | (df["iv"] > 1000)).sum()
+                    if bad:
+                        issues.append(f"IV OUT OF RANGE: {rel} -> {bad} rows{suffix}")
+
+                if "funding_rate" in df.columns:
+                    bad = (df["funding_rate"].abs() > 0.1).sum()
+                    if bad:
+                        issues.append(f"EXTREME FUNDING: {rel} -> {bad} rows >10pct{suffix}")
+
+                if "spread" in df.columns:
+                    bad = (df["spread"] < 0).sum()
+                    if bad:
+                        issues.append(f"NEGATIVE SPREAD: {rel} -> {bad} rows{suffix}")
+
+                del df
+            except Exception:
+                pass
+    return issues
+
+
+# ── Cross-source consistency (runbook 4.1) ──
+
+def check_cross_source_consistency(
+    sources: Dict[Tuple[str, str, str], List[str]],
+) -> List[str]:
+    """Compare Binance vs Deribit mark prices for BTC and ETH."""
+    results: List[str] = []
+    for base_sym in ["BTC", "ETH"]:
+        binance_key = ("binance", "mark_price", f"{base_sym}USDT")
+        deribit_key = ("deribit", "mark_price", f"{base_sym}-PERPETUAL")
+        b_files = sources.get(binance_key, [])
+        d_files = sources.get(deribit_key, [])
+        if not b_files or not d_files:
+            continue
+
+        # Group files by date
+        from collections import defaultdict as dd
+        b_by_date: Dict[str, str] = {}
+        d_by_date: Dict[str, str] = {}
+        for f in b_files:
+            parts = os.path.splitext(os.path.basename(f))[0].rsplit("_", 1)
+            if len(parts) == 2:
+                b_by_date[parts[1]] = f
+        for f in d_files:
+            parts = os.path.splitext(os.path.basename(f))[0].rsplit("_", 1)
+            if len(parts) == 2:
+                d_by_date[parts[1]] = f
+
+        common_dates = sorted(set(b_by_date.keys()) & set(d_by_date.keys()))
+        for date in common_dates:
+            try:
+                b_df = pq.read_table(b_by_date[date]).to_pandas()
+                d_df = pq.read_table(d_by_date[date]).to_pandas()
+                if len(b_df) == 0 or len(d_df) == 0:
+                    continue
+                b_df["ts_min"] = (b_df["timestamp"] // 60000) * 60000
+                d_df["ts_min"] = (d_df["timestamp"] // 60000) * 60000
+                merged = b_df[["ts_min", "mark_price"]].merge(
+                    d_df[["ts_min", "mark_price"]], on="ts_min", suffixes=("_b", "_d"),
+                )
+                if len(merged) == 0:
+                    continue
+                merged["pct_diff"] = (
+                    (merged["mark_price_b"] - merged["mark_price_d"]).abs()
+                    / merged["mark_price_b"]
+                    * 100
+                )
+                results.append(
+                    f"{base_sym} {date}: {len(merged)} samples, "
+                    f"mean_diff={merged['pct_diff'].mean():.3f}%, "
+                    f"max_diff={merged['pct_diff'].max():.3f}%"
+                )
+                del b_df, d_df, merged
+            except Exception:
+                pass
+    return results
+
+
+# ── Greeks coverage per day (runbook 4.2) ──
+
+def check_greeks_coverage(
+    sources: Dict[Tuple[str, str, str], List[str]],
+) -> List[str]:
+    """Report instruments, rows, and IV coverage per greeks file."""
+    results: List[str] = []
+    for (exchange, data_type, symbol), files in sorted(sources.items()):
+        if data_type != "options_greeks":
+            continue
+        for fp in sorted(files):
+            try:
+                pf = pq.ParquetFile(fp)
+                rows = pf.metadata.num_rows
+                if rows == 0:
+                    continue
+                cols = set(pf.schema_arrow.names)
+                read_cols = []
+                if "instrument_name" in cols:
+                    read_cols.append("instrument_name")
+                if "iv" in cols:
+                    read_cols.append("iv")
+                if not read_cols:
+                    continue
+
+                # Sample for large files
+                if rows > _LARGE_FILE_ROWS:
+                    rg_count = pf.metadata.num_row_groups
+                    sample_rgs = list({0, rg_count // 2, rg_count - 1})
+                    chunks = []
+                    for ri in sample_rgs:
+                        try:
+                            chunks.append(pf.read_row_group(ri, columns=read_cols).to_pandas())
+                        except Exception:
+                            continue
+                    if not chunks:
+                        continue
+                    df = pd.concat(chunks, ignore_index=True)
+                    suffix = " (sampled)"
+                else:
+                    df = pf.read(columns=read_cols).to_pandas()
+                    suffix = ""
+
+                n_instruments = df["instrument_name"].nunique() if "instrument_name" in df.columns else 0
+                iv_pct = (1 - df["iv"].isna().mean()) * 100 if "iv" in df.columns else 100.0
+                results.append(
+                    f"{os.path.basename(fp)}: {n_instruments} instruments, "
+                    f"{len(df):,} rows{suffix}, iv_coverage={iv_pct:.1f}%"
+                )
+                del df
+            except Exception:
+                pass
+    return results
 
 def _sep(c="=", w=90): print(c * w)
 def _sec(t): print(f"\n{'='*90}\n  {t}\n{'='*90}")
@@ -369,10 +586,6 @@ def generate_report(data_dir: str, log_path: Optional[str], strategies: Dict) ->
             print(f"\n  Greeks cycles: {dict(sorted(lr['greeks_stats'].items()))}")
         if lr.get("vol_surface_stats"):
             print(f"  Vol surface builds: {dict(sorted(lr['vol_surface_stats'].items()))}")
-        if lr.get("date_1970_flushes"):
-            print(f"\n  ANOMALY: {len(lr['date_1970_flushes'])} epoch-zero flushes!")
-            for x in lr["date_1970_flushes"][:5]:
-                print(f"    {x}")
         if lr["status"] != "OK":
             all_ok = False
     else:
@@ -399,10 +612,9 @@ def generate_report(data_dir: str, log_path: Optional[str], strategies: Dict) ->
 
             print(f"  {_ic(sc.status)} {exchange}/{data_type}/{symbol}: {total_rows:,} rows, {len(fc_list)} files")
             for fc in fc_list:
-                dt = os.path.basename(os.path.dirname(fc.path))
                 fn = os.path.basename(fc.path)
                 ts_info = f"{fc.ts_min} ~ {fc.ts_max}" if fc.ts_min else "N/A"
-                print(f"       {dt}/{fn}: {fc.rows:,} rows, {fc.size_kb:.1f}KB | {ts_info}")
+                print(f"       {fn}: {fc.rows:,} rows, {fc.size_kb:.1f}KB | {ts_info}")
                 for w in fc.null_warnings:
                     print(f"         WARN: {w}")
                 for e in fc.errors:
@@ -443,8 +655,46 @@ def generate_report(data_dir: str, log_path: Optional[str], strategies: Dict) ->
             + (" (multi-instrument)" if multi else "")
         )
 
-    # 5. Strategy completeness
-    _sec("5. STRATEGY COMPLETENESS MATRIX")
+    # 5. Date boundary check (runbook 3.2)
+    _sec("5. DATE BOUNDARY CHECK")
+    date_issues = check_date_boundaries(sources)
+    if date_issues:
+        for iss in date_issues:
+            print(f"  [!!] {iss}")
+            all_ok = False
+    else:
+        print("  [OK] All files have timestamps matching their filename dates")
+
+    # 6. Value range sanity (runbook 3.3)
+    _sec("6. VALUE RANGE SANITY")
+    range_issues = check_value_ranges(sources)
+    if range_issues:
+        for iss in range_issues:
+            print(f"  [!!] {iss}")
+            all_ok = False
+    else:
+        print("  [OK] All value ranges within acceptable bounds")
+
+    # 7. Cross-source consistency (runbook 4.1/4.2)
+    _sec("7. CROSS-SOURCE CONSISTENCY")
+    _sub("7a. Mark Price Consistency (Binance vs Deribit)")
+    consistency = check_cross_source_consistency(sources)
+    if consistency:
+        for r in consistency:
+            print(f"  {r}")
+    else:
+        print("  [--] No overlapping mark_price data for cross-exchange comparison")
+
+    _sub("7b. Greeks Coverage per Day")
+    greeks_cov = check_greeks_coverage(sources)
+    if greeks_cov:
+        for r in greeks_cov:
+            print(f"  {r}")
+    else:
+        print("  [--] No options_greeks data found")
+
+    # 8. Strategy completeness
+    _sec("8. STRATEGY COMPLETENESS MATRIX")
     for strat in strategies.values():
         print(f"\n  [{strat.priority}] {strat.display_name} ({strat.name})")
         all_met = True
@@ -463,8 +713,8 @@ def generate_report(data_dir: str, log_path: Optional[str], strategies: Dict) ->
                     print(f"    {ic} {req.data_type:20s} | {exchange:12s} | {symbol:18s} | {info}")
         print(f"    Strategy status: {'ALL MET' if all_met else 'INCOMPLETE'}")
 
-    # 6. Summary
-    _sec("6. SUMMARY")
+    # 9. Summary
+    _sec("9. SUMMARY")
     total = sum(counts.values())
     print(f"  V3.0 sources: {total}")
     for st in ["OK", "WARNING", "ERROR", "MISSING"]:
@@ -473,8 +723,8 @@ def generate_report(data_dir: str, log_path: Optional[str], strategies: Dict) ->
     print(f"\n  {'ALL CHECKS PASSED' if all_ok else 'ISSUES FOUND — see details above'}")
     _sep()
 
-    # 7. All V3 parquet files (metadata only)
-    _sec("7. ALL V3 PARQUET FILES")
+    # 10. All V3 parquet files (metadata only)
+    _sec("10. ALL V3 PARQUET FILES")
     for (exchange, data_type, symbol), files in sorted(sources.items()):
         for fp in sorted(files):
             rel = os.path.relpath(fp, data_dir).replace("\\", "/")
@@ -485,33 +735,13 @@ def generate_report(data_dir: str, log_path: Optional[str], strategies: Dict) ->
             except Exception:
                 print(f"  {rel} (READ ERROR)")
 
-    # 8. Legacy V1/V2 data
-    _sec("8. LEGACY V1/V2 DATA (not verified)")
-    legacy_dirs = []
-    for d in sorted(os.listdir(data_dir)):
-        full = os.path.join(data_dir, d)
-        if not os.path.isdir(full):
-            continue
-        # V3.0 dirs have Hive subdirs, legacy dirs have flat .parquet files
-        has_hive = any(_V3_DATE_RE.search(os.path.basename(sd))
-                       for sd in glob.glob(os.path.join(full, "*", "date=*")))
-        flat_files = glob.glob(os.path.join(full, "*.parquet"))
-        if flat_files:
-            total_kb = sum(os.path.getsize(f) for f in flat_files) / 1024
-            legacy_dirs.append((d, len(flat_files), total_kb))
-    if legacy_dirs:
-        for name, count, kb in legacy_dirs:
-            print(f"  {name}/: {count} files, {kb:.0f}KB total")
-    else:
-        print("  (none)")
-
     return all_ok
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="V3.0 Data Collection Verification")
-    parser.add_argument("--data-dir", default="./data")
-    parser.add_argument("--log", default="./logs/collector.log")
+    parser.add_argument("--data-dir", default="./deribit-options-data-collector/data")
+    parser.add_argument("--log", default="./deribit-options-data-collector/logs/collector.log")
     parser.add_argument("--no-log", action="store_true")
     args = parser.parse_args()
 

@@ -208,12 +208,16 @@ class FundingRateFetcher:
 
             results: List[FundingRate] = []
             for item in data:
+                # Hyperliquid fundingHistory returns "premium" which is the
+                # mark-index spread, NOT the mark_price.  Store as None to
+                # avoid misleading downstream consumers.
                 results.append(FundingRate(
                     timestamp=int(item["time"]),
                     exchange="hyperliquid",
                     symbol=coin,
                     funding_rate=float(item["fundingRate"]),
-                    mark_price=float(item.get("premium", 0)) or None,
+                    mark_price=None,
+                    index_price=None,
                 ))
 
             logger.info(f"Hyperliquid {coin}: fetched {len(results)} funding records")

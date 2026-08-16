@@ -17,15 +17,19 @@ V3.0 期权+合约策略数据采集系统 — 统一启动入口
 from __future__ import annotations
 
 import argparse
+import calendar
 import gc
 import os
 import signal
 import sys
 import time
 import threading
+
+import requests
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
 # ── sys.path 预处理: 导入父目录的 V3.0 模块 ──
@@ -50,11 +54,15 @@ from fetchers.funding_rate import FundingRateFetcher
 from fetchers.mark_price import MarkPriceFetcher
 from fetchers.risk_free_rate import RiskFreeRateFetcher
 from fetchers.margin_params import MarginParamsFetcher
-from fetchers.binance_spot_fetcher import BinanceSpotPriceFetcher
+from collections import deque
+
+from fetchers.deribit_market_data import DeribitMarketDataFetcher, IndexPriceSnapshot
+from fetchers.deribit_options_ws import DeribitOptionsQuoteEngine
 from processors.greeks_processor import GreeksProcessor, DeribitOptionsChainFetcher
 from processors.basis_calculator import BasisCalculator, BasisPoint
 from processors.vol_surface import VolatilitySurfaceBuilder
 from processors.iv_rank import IVRankTracker
+from processors import validators as V
 from pipeline.strategy_configs import get_all_strategies, StrategyConfig, DataRequirement
 from utils import get_logger
 from utils.config_loader import ConfigLoader
@@ -90,17 +98,22 @@ RISK_FREE_RATE_INTERVAL_SEC = 24 * 3600  # 24h
 PRUNE_HOUR = 3                          # 3am local time trigger
 DEFAULT_PRUNE_KEEP_DAYS = 14            # retain 14 days of data
 
-# Deribit WS 频道模板
+# Deribit WS 频道模板 — USDC-settled perpetuals
 DERIBIT_WS_CHANNELS = [
-    "ticker.BTC-PERPETUAL.100ms",
-    "ticker.ETH-PERPETUAL.100ms",
+    "ticker.BTC_USDC-PERPETUAL.100ms",
+    "ticker.ETH_USDC-PERPETUAL.100ms",
+    "ticker.SOL_USDC-PERPETUAL.100ms",
 ]
 
 # Signal Activation intervals
 SPOT_PRICE_INTERVAL_SEC = 1
 GREEKS_INTERVAL_SEC = 5
 BASIS_VOL_INTERVAL_SEC = 10
-SPOT_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+SPOT_SYMBOLS = ["BTC_USDC", "ETH_USDC", "SOL_USDC"]  # Deribit USDC spot tickers
+
+# Deribit market data intervals
+DVOL_INTERVAL_SEC = 30          # DVOL index (slow-moving, 30s is plenty)
+INDEX_PRICE_INTERVAL_SEC = 10   # Real settlement index price
 
 
 @dataclass
@@ -261,33 +274,42 @@ class GreeksProcessorThread(CollectorThread):
         shutdown_event: threading.Event,
         shared_state: Dict,
         state_lock: threading.Lock,
+        options_ws: Optional[DeribitOptionsQuoteEngine] = None,
     ) -> None:
         super().__init__("GreeksProcessor", "P0", shutdown_event)
         self._buffer = buffer
         self._shared_state = shared_state
         self._state_lock = state_lock
-        self._chain_fetcher = DeribitOptionsChainFetcher()
+        self._options_ws = options_ws
+        self._chain_fetcher = DeribitOptionsChainFetcher(ws_engine=options_ws)
         self._greeks_proc = GreeksProcessor()
 
     def run(self) -> None:
         logger.info("[GreeksProcessor] 启动，轮询间隔 5s")
         while not self._shutdown.is_set():
+            if self._options_ws:
+                try:
+                    self._options_ws.maybe_refresh()
+                except Exception as e:
+                    logger.warning(f"[GreeksProcessor] options WS refresh: {e}")
             try:
                 with self._state_lock:
                     rfr = self._shared_state.get("risk_free_rate", 0.05)
 
-                for currency in ["BTC", "ETH"]:
-                    chain = self._chain_fetcher.fetch_option_chain(currency)
+                # Linear (USDC-settled) options: BTC_USDC, ETH_USDC, SOL_USDC
+                usdc_chains = self._chain_fetcher.fetch_usdc_option_chains()
+                for base, chain in usdc_chains.items():
                     if not chain:
                         continue
-
                     result_df = self._greeks_proc.compute_batch(chain, risk_free_rate=rfr)
                     if not result_df.empty:
+                        result_df = V.validate_options_greeks(result_df)
+                    if not result_df.empty:
                         self._buffer.append(
-                            "deribit", "options_greeks", currency, result_df,
+                            "deribit", "options_greeks", base, result_df,
                         )
                         with self._state_lock:
-                            self._shared_state["latest_greeks"][currency] = result_df
+                            self._shared_state["latest_greeks"][base] = result_df
                         self.mark_success()
                         del result_df
 
@@ -329,7 +351,7 @@ class BasisVolProcessorThread(CollectorThread):
                 sym,
                 state_file=os.path.join(state_dir, f"iv_rank_{sym}.json"),
             )
-            for sym in ("BTC", "ETH")
+            for sym in ("BTC_USDC", "ETH_USDC", "SOL_USDC")
         }
         for tracker in self._iv_trackers.values():
             tracker.bootstrap_from_parquet(abs_data_dir)
@@ -362,11 +384,9 @@ class BasisVolProcessorThread(CollectorThread):
             perp = dict(self._shared_state.get("perp_prices", {}))
 
         now_ms = int(time.time() * 1000)
-        mapping = {"BTCUSDT": "BTC", "ETHUSDT": "ETH"}
-
-        for spot_sym, currency in mapping.items():
-            spot_price = spot.get(spot_sym)
-            perp_price = perp.get(currency)
+        for sym in ("BTC_USDC", "ETH_USDC", "SOL_USDC"):
+            spot_price = spot.get(sym)
+            perp_price = perp.get(sym)
             if not spot_price or not perp_price or spot_price <= 0:
                 continue
 
@@ -376,7 +396,7 @@ class BasisVolProcessorThread(CollectorThread):
 
             bp = BasisPoint(
                 timestamp=now_ms,
-                symbol=f"{currency}_USDT",
+                symbol=sym,
                 basis_type="spot_perp",
                 spot_price=spot_price,
                 perp_price=perp_price,
@@ -386,14 +406,13 @@ class BasisVolProcessorThread(CollectorThread):
                 days_to_expiry=365,
             )
 
-            import numpy as np
             row = bp.to_dict()
             for k, v in row.items():
                 if isinstance(v, float):
                     row[k] = np.float32(v)
 
             self._buffer.append(
-                "binance", "basis", f"{currency}_USDT",
+                "deribit", "basis", sym,
                 pd.DataFrame([row]),
             )
             self.mark_success()
@@ -403,7 +422,7 @@ class BasisVolProcessorThread(CollectorThread):
         with self._state_lock:
             greeks_by_currency = dict(self._shared_state.get("latest_greeks", {}))
 
-        for currency in ["BTC", "ETH"]:
+        for currency in ("BTC_USDC", "ETH_USDC", "SOL_USDC"):
             subset = greeks_by_currency.get(currency)
             if subset is None or subset.empty:
                 continue
@@ -434,7 +453,6 @@ class BasisVolProcessorThread(CollectorThread):
                 # so the current day never ranks against itself.
                 tracker.update(point.timestamp, point.atm_iv)
 
-                import numpy as np
                 row = {
                     "timestamp": point.timestamp,
                     "symbol": currency,
@@ -453,6 +471,157 @@ class BasisVolProcessorThread(CollectorThread):
 
             except Exception as e:
                 logger.warning(f"[BasisVol] Vol surface error for {currency}: {e}")
+
+
+class DvolCollectorThread(CollectorThread):
+    """DVOL (Deribit Volatility Index) collector — T2.
+
+    Polls public/get_volatility_index_data for BTC and ETH and writes to
+    deribit/dvol/{BTC,ETH}_*.parquet. The 0-1DTE strategy uses this for
+    VIX-rank-style position scaling instead of proxying atm_iv.
+    """
+
+    def __init__(
+        self,
+        buffer: ChunkedBuffer,
+        shutdown_event: threading.Event,
+    ) -> None:
+        super().__init__("DvolCollector", "P1", shutdown_event)
+        self._buffer = buffer
+        self._fetcher = DeribitMarketDataFetcher()
+
+    def run(self) -> None:
+        logger.info(f"[DvolCollector] 启动，轮询间隔 {DVOL_INTERVAL_SEC}s")
+        poll_count = 0
+        while not self._shutdown.is_set():
+            try:
+                poll_count += 1
+                for currency in ("BTC", "ETH"):
+                    snap = self._fetcher.fetch_dvol(currency)
+                    if snap is None or snap.dvol <= 0:
+                        logger.warning(
+                            f"[DvolCollector] poll={poll_count} {currency} "
+                            f"no data (snap={snap})"
+                        )
+                        continue
+                    df = V.validate_dvol(
+                        pd.DataFrame([snap.to_dict()])
+                    )
+                    if df.empty:
+                        logger.warning(
+                            f"[DvolCollector] poll={poll_count} {currency} "
+                            f"validate_dvol dropped row (dvol={snap.dvol})"
+                        )
+                        continue
+                    self._buffer.append(
+                        "deribit", "dvol", currency, df,
+                    )
+                    self.mark_success()
+                    if poll_count % 4 == 0:
+                        logger.info(
+                            f"[DvolCollector] poll={poll_count} {currency} "
+                            f"dvol={snap.dvol:.2f} buffered"
+                        )
+            except Exception as e:
+                self._error_count += 1
+                logger.warning(f"[DvolCollector] 异常: {e}")
+
+            self._shutdown.wait(DVOL_INTERVAL_SEC)
+
+        logger.info("[DvolCollector] 退出")
+
+
+class IndexPriceCollectorThread(CollectorThread):
+    """Real Deribit index price collector — T3.
+
+    Polls public/ticker on {BTC,ETH,SOL}_USDC-PERPETUAL for ``index_price`` —
+    the settlement index used for option delivery. This is NOT the perpetual
+    mark price (which carries basis). Writes to
+    deribit/index_price/{BTC_USDC,ETH_USDC,SOL_USDC}_*.parquet.
+
+    EDP (estimated_delivery_price) is computed as a rolling 30-minute
+    TWAP of the index, matching Deribit's option settlement mechanism
+    (07:30–08:00 UTC TWAP). The REST API ``public/ticker`` returns
+    EDP = index_price for all instruments, so local computation is
+    required.
+    """
+
+    _EDP_WINDOW_SEC = 1800       # 30 minutes
+    _EDP_MAX_SAMPLES = 200       # at 10s interval ≈ 30 min + buffer
+
+    def __init__(
+        self,
+        buffer: ChunkedBuffer,
+        shutdown_event: threading.Event,
+        shared_state: Dict,
+        state_lock: threading.Lock,
+    ) -> None:
+        super().__init__("IndexPrice", "P0", shutdown_event)
+        self._buffer = buffer
+        self._shared_state = shared_state
+        self._state_lock = state_lock
+        self._fetcher = DeribitMarketDataFetcher()
+        self._index_history: Dict[str, deque] = {
+            "BTC_USDC": deque(maxlen=self._EDP_MAX_SAMPLES),
+            "ETH_USDC": deque(maxlen=self._EDP_MAX_SAMPLES),
+            "SOL_USDC": deque(maxlen=self._EDP_MAX_SAMPLES),
+        }
+
+    def _compute_edp(self, currency: str) -> float:
+        """Compute rolling 30-min TWAP of index price as EDP."""
+        history = self._index_history[currency]
+        if not history:
+            return 0.0
+        now_ms = int(time.time() * 1000)
+        window_ms = self._EDP_WINDOW_SEC * 1000
+        cutoff_ms = now_ms - window_ms
+        windowed = [ip for ts, ip in history if ts >= cutoff_ms]
+        if not windowed:
+            return history[-1][1] if history else 0.0
+        return sum(windowed) / len(windowed)
+
+    def run(self) -> None:
+        logger.info(f"[IndexPrice] 启动，轮询间隔 {INDEX_PRICE_INTERVAL_SEC}s")
+        while not self._shutdown.is_set():
+            try:
+                for currency in ("BTC_USDC", "ETH_USDC", "SOL_USDC"):
+                    snap = self._fetcher.fetch_index_price(currency)
+                    if snap is None or snap.index_price <= 0:
+                        continue
+
+                    # Maintain rolling history for TWAP computation
+                    self._index_history[currency].append(
+                        (snap.timestamp, snap.index_price)
+                    )
+
+                    # Replace REST EDP (always == index_price) with
+                    # locally-computed rolling 30-min TWAP
+                    edp = self._compute_edp(currency)
+                    fixed_snap = IndexPriceSnapshot(
+                        timestamp=snap.timestamp,
+                        symbol=snap.symbol,
+                        index_price=snap.index_price,
+                        mark_price=snap.mark_price,
+                        estimated_delivery_price=edp,
+                    )
+
+                    df = V.validate_index_price(
+                        pd.DataFrame([fixed_snap.to_dict()])
+                    )
+                    if not df.empty:
+                        self._buffer.append(
+                            "deribit", "index_price", currency, df,
+                        )
+                        with self._state_lock:
+                            self._shared_state["index_prices"][currency] = snap.index_price
+                        self.mark_success()
+            except Exception as e:
+                self._error_count += 1
+                logger.warning(f"[IndexPrice] 异常: {e}")
+
+            self._shutdown.wait(INDEX_PRICE_INTERVAL_SEC)
+
+        logger.info("[IndexPrice] 退出")
 
 
 class ResourceMonitor:
@@ -566,10 +735,11 @@ class SystemLauncher:
 
         # Signal Activation shared state (cross-thread data)
         self._shared_state: Dict = {
-            "spot_prices": {},       # {"BTCUSDT": 103000.0}
-            "perp_prices": {},       # {"BTC": 103050.0}
+            "spot_prices": {},       # {"BTC_USDC": 103000.0, ...}
+            "perp_prices": {},       # {"BTC_USDC": 103050.0, ...}
+            "index_prices": {},      # {"BTC_USDC": 102980.0, ...} — real Deribit index
             "risk_free_rate": 0.05,
-            "latest_greeks": {},     # {"BTC": df, "ETH": df} — per-currency
+            "latest_greeks": {},     # {"BTC_USDC": df, ...} — per-currency
         }
         self._state_lock = threading.Lock()
 
@@ -664,6 +834,17 @@ class SystemLauncher:
         self._ws_fetcher.add_ws_channels(DERIBIT_WS_CHANNELS)
         self._ws_fetcher.start_ws()
 
+        # Options quote WS engine (quote.{instrument}) — provides
+        # bid_size/ask_size coverage for the full options chain on every
+        # greeks tick. Hourly refresh picks up new expiries.
+        self._options_ws = DeribitOptionsQuoteEngine()
+        self._options_ws.start()
+        time.sleep(2)  # let the WS connection establish before subscribing
+        try:
+            self._options_ws.maybe_refresh(force=True)
+        except Exception as e:
+            logger.warning(f"Options quote WS 初始订阅失败: {e}")
+
         bridge = WSBridgeCollector(
             quote_fetcher=self._ws_fetcher,
             buffer=self._buffer,
@@ -688,18 +869,54 @@ class SystemLauncher:
                     records = mark_fetcher.fetch_binance(symbol, start_ms, now_ms)
                     if records:
                         rows = [r.to_dict() for r in records]
+                        # Fill index_price from premiumIndex (Binance
+                        # markPriceKlines only returns mark OHLC, not index).
+                        try:
+                            pi = requests.get(
+                                "https://fapi.binance.com/fapi/v1/premiumIndex",
+                                params={"symbol": symbol},
+                                timeout=10,
+                            ).json()
+                            ip = float(pi.get("indexPrice", 0))
+                            mp = float(pi.get("markPrice", 0))
+                            if ip > 0:
+                                for row in rows:
+                                    row["index_price"] = ip
+                                    row["basis"] = row.get("mark_price", mp) - ip
+                        except Exception:
+                            pass
                         self._buffer.append("binance", "mark_price", symbol, pd.DataFrame(rows))
                         total += len(records)
                 except Exception as e:
                     logger.warning(f"MarkPrice Binance {symbol}: {e}")
 
-            for symbol in ["BTC-PERPETUAL", "ETH-PERPETUAL"]:
+            for symbol in ["BTC_USDC-PERPETUAL", "ETH_USDC-PERPETUAL", "SOL_USDC-PERPETUAL"]:
                 try:
                     records = mark_fetcher.fetch_deribit(symbol, start_ms, now_ms)
                     if records:
                         rows = [r.to_dict() for r in records]
-                        self._buffer.append("deribit", "mark_price", symbol, pd.DataFrame(rows))
-                        total += len(records)
+                        # T3: fill index_price from the real Deribit settlement
+                        # index. fetch_deribit only returns mark klines, so we
+                        # pull the current index_price via ticker and attach it
+                        # to each row. This is approximate for historical rows
+                        # in the batch but ensures the column is non-NULL going
+                        # forward. The dedicated index_price stream provides
+                        # the precise sub-minute series.
+                        currency = symbol.split("-")[0]
+                        try:
+                            mdf = DeribitMarketDataFetcher()
+                            ip_snap = mdf.fetch_index_price(currency)
+                            if ip_snap and ip_snap.index_price > 0:
+                                for row in rows:
+                                    row["index_price"] = ip_snap.index_price
+                                    row["basis"] = row["mark_price"] - ip_snap.index_price
+                        except Exception as e:
+                            logger.debug(f"MarkPrice index fill {symbol}: {e}")
+                        df = pd.DataFrame(rows)
+                        df = V.validate_mark_price(df)
+                        if not df.empty:
+                            self._buffer.append("deribit", "mark_price", symbol, df)
+                            total += len(df)
                 except Exception as e:
                     logger.warning(f"MarkPrice Deribit {symbol}: {e}")
 
@@ -715,24 +932,25 @@ class SystemLauncher:
         mark_poller.start()
         self._collectors.append(mark_poller)
 
-        # ── SpotPrice Poller (P0) ──
-        spot_fetcher = BinanceSpotPriceFetcher()
+        # ── SpotPrice Poller (P0) — Deribit USDC spot tickers ──
+        spot_fetcher = DeribitMarketDataFetcher()
 
         def _poll_spot_price() -> int:
             total = 0
-            try:
-                prices = spot_fetcher.fetch_prices(SPOT_SYMBOLS)
-                for sp in prices:
+            for symbol in SPOT_SYMBOLS:
+                try:
+                    sp = spot_fetcher.fetch_spot_ticker(symbol)
+                    if sp is None:
+                        continue
                     self._buffer.append(
-                        "binance", "spot_price", sp.symbol,
+                        "deribit", "spot_price", sp.symbol,
                         pd.DataFrame([sp.to_dict()]),
                     )
                     total += 1
-                with self._state_lock:
-                    for sp in prices:
+                    with self._state_lock:
                         self._shared_state["spot_prices"][sp.symbol] = sp.price
-            except Exception as e:
-                logger.warning(f"SpotPrice: {e}")
+                except Exception as e:
+                    logger.warning(f"SpotPrice {symbol}: {e}")
             return total
 
         spot_poller = RESTPollerCollector(
@@ -751,9 +969,20 @@ class SystemLauncher:
             shutdown_event=self._shutdown_event,
             shared_state=self._shared_state,
             state_lock=self._state_lock,
+            options_ws=self._options_ws,
         )
         greeks_thread.start()
         self._collectors.append(greeks_thread)
+
+        # ── Index Price Collector (P0) — real Deribit settlement index (T3) ──
+        index_thread = IndexPriceCollectorThread(
+            buffer=self._buffer,
+            shutdown_event=self._shutdown_event,
+            shared_state=self._shared_state,
+            state_lock=self._state_lock,
+        )
+        index_thread.start()
+        self._collectors.append(index_thread)
 
     def _start_p1_collectors(self) -> None:
         """Phase 2: P1 级数据源 — 资金费率 + 保证金参数。"""
@@ -766,15 +995,66 @@ class SystemLauncher:
         # FundingRate
         funding_fetcher = FundingRateFetcher()
 
+        def _binance_funding_with_snapshot(symbol: str, start_ms: int, end_ms: int):
+            """Historical events (authoritative funding_rate) enriched with
+            current mark_price/index_price from the realtime endpoint.
+
+            The /fundingRate history endpoint doesn't return mark/index; the
+            /premiumIndex realtime endpoint does but only gives the most
+            recent funding rate. Combine: take all historical events in the
+            poll window, then overlay current mark/index onto the latest one.
+            Older events keep mark/index=None (Binance doesn't expose historical
+            mark/index at the funding instant).
+            """
+            from dataclasses import replace as _replace
+            records = list(funding_fetcher.fetch_binance(symbol, start_ms, end_ms))
+            rt = funding_fetcher.fetch_binance_realtime(symbol)
+            if rt is None:
+                return records
+            if not records:
+                return [rt]
+            records[-1] = _replace(
+                records[-1],
+                mark_price=rt.mark_price,
+                index_price=rt.index_price,
+            )
+            return records
+
         def _poll_funding_rate() -> int:
             total = 0
             now_ms = int(time.time() * 1000)
             start_ms = now_ms - FUNDING_RATE_INTERVAL_SEC * 1000
 
+            def _deribit_funding_with_snapshot(instrument: str, start_ms: int, end_ms: int):
+                """Deribit funding history doesn't return mark_price.
+                Supplement with current mark_price from public/ticker."""
+                records = list(funding_fetcher.fetch_deribit(instrument, start_ms, end_ms))
+                if not records:
+                    return records
+                try:
+                    currency = instrument.split("-")[0]
+                    mdf = DeribitMarketDataFetcher()
+                    ip_snap = mdf.fetch_index_price(currency)
+                    if ip_snap and ip_snap.mark_price > 0:
+                        from dataclasses import replace as _replace
+                        records[-1] = _replace(
+                            records[-1],
+                            mark_price=ip_snap.mark_price,
+                        )
+                except Exception:
+                    pass
+                return records
+
             tasks = [
-                ("binance", "BTCUSDT", lambda: funding_fetcher.fetch_binance("BTCUSDT", start_ms, now_ms)),
-                ("deribit", "BTC-PERPETUAL", lambda: funding_fetcher.fetch_deribit("BTC-PERPETUAL", start_ms, now_ms)),
+                ("binance", "BTCUSDT", lambda: _binance_funding_with_snapshot("BTCUSDT", start_ms, now_ms)),
+                ("binance", "ETHUSDT", lambda: _binance_funding_with_snapshot("ETHUSDT", start_ms, now_ms)),
+                ("binance", "SOLUSDT", lambda: _binance_funding_with_snapshot("SOLUSDT", start_ms, now_ms)),
+                ("deribit", "BTC_USDC-PERPETUAL", lambda: _deribit_funding_with_snapshot("BTC_USDC-PERPETUAL", start_ms, now_ms)),
+                ("deribit", "ETH_USDC-PERPETUAL", lambda: _deribit_funding_with_snapshot("ETH_USDC-PERPETUAL", start_ms, now_ms)),
+                ("deribit", "SOL_USDC-PERPETUAL", lambda: _deribit_funding_with_snapshot("SOL_USDC-PERPETUAL", start_ms, now_ms)),
                 ("hyperliquid", "BTC", lambda: funding_fetcher.fetch_hyperliquid("BTC", start_ts=start_ms, end_ts=now_ms)),
+                ("hyperliquid", "ETH", lambda: funding_fetcher.fetch_hyperliquid("ETH", start_ts=start_ms, end_ts=now_ms)),
+                ("hyperliquid", "SOL", lambda: funding_fetcher.fetch_hyperliquid("SOL", start_ts=start_ms, end_ts=now_ms)),
             ]
             for exchange, symbol, fn in tasks:
                 try:
@@ -834,6 +1114,14 @@ class SystemLauncher:
         basis_vol_thread.start()
         self._collectors.append(basis_vol_thread)
 
+        # ── DVOL Collector (P1) — Deribit volatility index (T2) ──
+        dvol_thread = DvolCollectorThread(
+            buffer=self._buffer,
+            shutdown_event=self._shutdown_event,
+        )
+        dvol_thread.start()
+        self._collectors.append(dvol_thread)
+
     def _start_p2_collectors(self) -> None:
         """Phase 3: P2 级数据源 — 无风险利率。"""
         if not self._should_run("P2"):
@@ -855,6 +1143,9 @@ class SystemLauncher:
             self._fred_mode = "Live (FRED API)"
 
         cache_dir = config.get_value("api", "fred", "cache_dir", default="./cache/fred")
+        # 相对路径锚定到子项目目录, 避免随运行 CWD 漂移产生双份缓存
+        if not os.path.isabs(cache_dir):
+            cache_dir = os.path.join(_SUBPROJECT_DIR, cache_dir)
 
         risk_fetcher = RiskFreeRateFetcher(
             api_key=fred_key or "DEGRADED",
@@ -870,7 +1161,7 @@ class SystemLauncher:
                     for r in curve:
                         d = r.to_dict() if hasattr(r, 'to_dict') else vars(r)
                         d["timestamp"] = int(
-                            time.mktime(time.strptime(d.get("date", today), "%Y-%m-%d"))
+                            calendar.timegm(time.strptime(d.get("date", today), "%Y-%m-%d"))
                         ) * 1000
                         rows.append(d)
                     self._buffer.append("fred", "risk_free_rate", "USD", pd.DataFrame(rows))
@@ -941,6 +1232,16 @@ class SystemLauncher:
         # 1. 设置 shutdown event (可能已经设置了)
         self._shutdown_event.set()
 
+        # 1a. 立即取消周期 flush 定时器，防止它与 close_all_writers 抢 _lock
+        #     导致优雅退出超时被强杀、丢当天数据。
+        try:
+            t = getattr(self._buffer, "_timer", None)
+            if t is not None:
+                t.cancel()
+                self._buffer._timer = None
+        except Exception:
+            pass
+
         # 2. 停止 WS Bridge (关闭 WebSocket 连接)
         for c in self._collectors:
             try:
@@ -957,6 +1258,15 @@ class SystemLauncher:
             except Exception:
                 pass
 
+        # 3.5 停止 Options quote WS engine (在 greeks 线程退出之后)
+        options_ws = getattr(self, "_options_ws", None)
+        if options_ws is not None:
+            try:
+                options_ws.stop()
+                logger.info("Options quote WS engine 已停止")
+            except Exception as e:
+                logger.warning(f"停止 Options quote WS 失败: {e}")
+
         # 4. 最终 flush — 确保内存中的数据全部落盘
         flushed_rows = 0
         if self._buffer:
@@ -965,6 +1275,15 @@ class SystemLauncher:
                 logger.info(f"最终 flush: {flushed_rows} rows")
             except Exception as e:
                 logger.error(f"最终 flush 失败: {e}")
+            # Finalize append-only Parquet writers (write footers). Writers
+            # stay open between flushes for memory efficiency; without this
+            # close, the day-files lack a footer and are unreadable on restart
+            # (the restart-merge would quarantine them, losing the day's data).
+            try:
+                self._buffer.close_all_writers()
+                logger.info("parquet writers finalized (footers written)")
+            except Exception as e:
+                logger.error(f"close_all_writers 失败: {e}")
 
         # 5. 停止 Monitor
         if self._monitor:
@@ -973,9 +1292,11 @@ class SystemLauncher:
         # 6. 显式 GC
         gc.collect()
 
-        # 7. 数据完整性审计 (flush 之后，数据已全部落盘)
-        if self._mode == "live" and elapsed > 300:
-            self._run_data_audit()
+        # 7. 数据完整性审计 —— 关停时跳过：它会 pd.read_parquet 读取全部 parquet
+        #    文件 (GB 级, 分钟级耗时)，拖慢退出导致超时强杀、丢当天 open-writer 数据。
+        #    需要审计时用 verify-data skill 按需运行。
+        # if self._mode == "live" and elapsed > 300:
+        #     self._run_data_audit()
 
         # 8. 打印运行摘要
         self._print_summary(elapsed, flushed_rows)
@@ -992,8 +1313,6 @@ class SystemLauncher:
         if not os.path.isdir(data_dir):
             logger.warning("数据审计跳过: 数据目录不存在")
             return
-
-        import pandas as pd
 
         audit_lines: List[str] = []
         audit_lines.append(f"# 数据完整性审计报告")
@@ -1099,6 +1418,15 @@ def main() -> None:
         help="策略优先级过滤: all, P0, P0,P1 等",
     )
     args = parser.parse_args()
+
+    # Memory diagnostics: tracemalloc snapshots every 10 min -> logs/mem_trace.log.
+    # Lets us distinguish a Python-level leak (tracked size climbs with RSS) from
+    # allocator retention (tracked flat, RSS climbs). Safe no-op if unavailable.
+    try:
+        from utils.mem_trace import start as _start_mem_trace
+        _start_mem_trace(interval_sec=600)
+    except Exception as _e:
+        logger.warning(f"mem_trace disabled: {_e}")
 
     launcher = SystemLauncher(args)
     launcher.run()

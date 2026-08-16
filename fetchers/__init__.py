@@ -1,5 +1,7 @@
 from .base import BaseFetcher
 from .binance import BinanceSpotFetcher, BinanceUSDMFetcher
+from . import binance_archive
+from .binance_index_klines import BinanceIndexKlinesFetcher
 from .deribit import DeribitFetcher
 from .deribit_options import DeribitOptionsFetcher
 from .hyperliquid import HyperliquidFetcher
@@ -15,6 +17,8 @@ __all__ = [
     'BaseFetcher',
     'BinanceSpotFetcher',
     'BinanceUSDMFetcher',
+    'binance_archive',
+    'BinanceIndexKlinesFetcher',
     'DeribitFetcher',
     'DeribitOptionsFetcher',
     'HyperliquidFetcher',
