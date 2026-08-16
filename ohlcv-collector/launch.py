@@ -1,4 +1,5 @@
 import argparse
+import json
 import time
 import yaml
 import sys
@@ -30,6 +31,27 @@ TIMEFRAME_MS = {
 
 # 每个文件最多修补的空洞数, 防止对零成交量缺桶反复无效请求
 MAX_GAPS_PER_FILE = 50
+
+# gapfill 挂起状态: 超出单轮上限的空洞记入 state/, 下轮优先处理,
+# 避免小空洞因"按大小排序"永远进不了 top-N 而永久饥饿
+_STATE_DIR = os.path.join(_SUBPROJECT_DIR, "state")
+_GAPFILL_STATE_FILE = os.path.join(_STATE_DIR, "gapfill_pending.json")
+
+
+def _load_gapfill_state() -> dict:
+    try:
+        with open(_GAPFILL_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_gapfill_state(state: dict) -> None:
+    os.makedirs(_STATE_DIR, exist_ok=True)
+    tmp = _GAPFILL_STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, _GAPFILL_STATE_FILE)
 
 
 class DataPipeline:
@@ -239,7 +261,12 @@ class DataPipeline:
         logger.info(f"总计新增: {total_added} 条记录")
 
     def run_gapfill(self, timeframes: list[str] = None, exchanges: list[str] = None):
-        """检测已有文件头尾之间的内部空洞并补拉(回填只处理头尾缺口)。"""
+        """检测已有文件头尾之间的内部空洞并补拉(回填只处理头尾缺口)。
+
+        超出 MAX_GAPS_PER_FILE 的空洞挂起到 state/gapfill_pending.json,
+        下一轮优先处理; 已尝试但补不上的(零成交缺桶)视为耗尽不再挂起,
+        保证每处空洞最终都会被尝试至少一次, 不会永久饥饿。
+        """
         if timeframes is None:
             timeframes = [self.default_timeframe]
 
@@ -248,6 +275,8 @@ class DataPipeline:
         if exchanges:
             logger.info(f"仅处理交易所: {exchanges}")
 
+        pending_state = _load_gapfill_state()
+        state_dirty = False
         total_added = 0
         for tf in timeframes:
             interval_ms = TIMEFRAME_MS.get(tf)
@@ -268,23 +297,50 @@ class DataPipeline:
                         for prev, curr in zip(ts_list, ts_list[1:])
                         if curr - prev > interval_ms
                     ]
-                    if not gaps:
+                    key = f"{exchange_name}|{unified_symbol}|{tf}"
+                    gap_set = set(gaps)
+                    prev_pending = [tuple(g) for g in pending_state.get(key, [])]
+
+                    # 上轮挂起且仍存在的空洞优先; 已被填上的自动淘汰
+                    deferred = [g for g in prev_pending if g in gap_set]
+                    fresh = [g for g in gaps if g not in set(deferred)]
+                    deferred.sort(key=lambda g: g[1] - g[0], reverse=True)
+                    fresh.sort(key=lambda g: g[1] - g[0], reverse=True)
+
+                    if deferred:
+                        logger.info(
+                            f"[{exchange_name}] {unified_symbol} ({tf}): "
+                            f"优先处理上轮挂起的 {len(deferred)} 处空洞"
+                        )
+
+                    # 尝试集 = 挂起优先, 再按大小补足
+                    attempt = (deferred + fresh)[:MAX_GAPS_PER_FILE]
+                    if not attempt:
+                        if key in pending_state:
+                            pending_state.pop(key)
+                            state_dirty = True
                         continue
 
-                    # 优先修补大空洞, 限制数量避免对零成交量缺桶反复无效请求
-                    gaps.sort(key=lambda g: g[1] - g[0], reverse=True)
-                    skipped = len(gaps) - MAX_GAPS_PER_FILE
-                    if skipped > 0:
-                        logger.warning(
-                            f"[{exchange_name}] {unified_symbol} ({tf}): "
-                            f"共 {len(gaps)} 处空洞, 仅修补最大的 {MAX_GAPS_PER_FILE} 处"
-                        )
-                        gaps = gaps[:MAX_GAPS_PER_FILE]
-
-                    logger.info(f"[{exchange_name}] {unified_symbol} ({tf}): 修补 {len(gaps)} 处内部空洞")
-                    for start_ms, end_ms in gaps:
+                    logger.info(f"[{exchange_name}] {unified_symbol} ({tf}): 修补 {len(attempt)} 处内部空洞")
+                    for start_ms, end_ms in attempt:
                         added = self._fetch_symbol(exchange_name, unified_symbol, tf, start_ms, end_ms)
                         total_added += added
+
+                    # 未尝试的挂起到下一轮; 尝试过仍缺的不再挂起(零成交缺桶)
+                    attempted_set = set(attempt)
+                    not_attempted = [g for g in gaps if g not in attempted_set]
+                    if not_attempted:
+                        pending_state[key] = [list(g) for g in not_attempted]
+                        state_dirty = True
+                        logger.info(
+                            f"    {len(not_attempted)} 处空洞挂起至下轮 (state/gapfill_pending.json)"
+                        )
+                    elif key in pending_state:
+                        pending_state.pop(key)
+                        state_dirty = True
+
+        if state_dirty:
+            _save_gapfill_state(pending_state)
 
         logger.info(f"\n=== 空洞修补完成 ===")
         logger.info(f"总计新增: {total_added} 条记录")
