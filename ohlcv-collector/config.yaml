@@ -51,7 +51,8 @@ exchanges:
     enabled: true
     base_url: "https://api.hyperliquid.xyz"
     rate_limit:
-      requests_per_minute: 1000
+      # candleSnapshot 权重较高, 1000 rpm 会触发持续 429, 降至安全值
+      requests_per_minute: 120
     symbols:
       BTC: "BTC"
       ETH: "ETH"

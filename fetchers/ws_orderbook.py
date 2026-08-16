@@ -10,7 +10,7 @@ import asyncio
 import gc
 import json
 import time
-from typing import Dict, Optional, Callable
+from typing import Callable, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 import websockets
@@ -80,6 +80,7 @@ class WSOrderbookEngine:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._deribit_req_id: int = 0
+        self._ws_loop: Optional[asyncio.AbstractEventLoop] = None
 
         self._ws_urls: Dict[str, str] = {
             "deribit": "wss://www.deribit.com/ws/api/v2",
@@ -96,6 +97,40 @@ class WSOrderbookEngine:
         for ch in channels:
             self.subscribe(ch)
 
+    def add_subscriptions_threadsafe(self, channels: List[str]) -> int:
+        """Add subscriptions from another thread without waiting for reconnect.
+
+        Updates the ``_subscriptions`` dict (persisted across reconnects) and,
+        when the WS is alive, schedules ``public/subscribe`` on the WS event
+        loop. Returns the number of newly added channels.
+        """
+        new = [c for c in channels if c and c not in self._subscriptions]
+        if not new:
+            return 0
+        for c in new:
+            inst = self._parse_instrument(c)
+            if inst:
+                self._subscriptions[c] = inst
+        if (self._ws_loop and self._ws_loop.is_running()
+                and self._ws and not _ws_is_closed(self._ws)):
+            asyncio.run_coroutine_threadsafe(
+                self._send_subscribe_request(new), self._ws_loop,
+            )
+        return len(new)
+
+    async def _send_subscribe_request(self, channels: List[str]) -> None:
+        self._deribit_req_id += 1
+        msg = {
+            "jsonrpc": "2.0",
+            "id": self._deribit_req_id,
+            "method": "public/subscribe",
+            "params": {"channels": channels},
+        }
+        try:
+            await self._ws.send(json.dumps(msg))
+        except Exception as e:
+            logger.warning(f"[{self.exchange}] subscribe send failed: {e}")
+
     def get_quote(self, instrument_name: str) -> Optional[L1Quote]:
         """Get the latest L1 quote for an instrument."""
         return self._state.get(instrument_name)
@@ -103,6 +138,31 @@ class WSOrderbookEngine:
     def get_all_quotes(self) -> Dict[str, L1Quote]:
         """Snapshot of all current L1 states."""
         return dict(self._state)
+
+    def get_sizes(
+        self,
+        instrument_names: List[str],
+        max_stale_sec: float = 300.0,
+    ) -> Dict[str, Tuple[float, float]]:
+        """Batch lookup of ``(bid_size, ask_size)`` for the given instruments.
+
+        Skips entries that are missing, stale (older than ``max_stale_sec``),
+        or have both sizes equal to zero (illiquid / no real quote).
+
+        Default staleness is 5 minutes: illiquid options can go minutes
+        between quote updates, and the last-known size is still meaningful
+        for carry-forward semantics. Tighter windows drop 40-70% of
+        instruments at any given moment.
+        """
+        cutoff_ms = (time.time() - max_stale_sec) * 1000
+        out: Dict[str, Tuple[float, float]] = {}
+        for name in instrument_names:
+            q = self._state.get(name)
+            if q is None or q.timestamp < cutoff_ms:
+                continue
+            if q.bid_size > 0 or q.ask_size > 0:
+                out[name] = (q.bid_size, q.ask_size)
+        return out
 
     def stop(self) -> None:
         """Signal shutdown and clear state."""
@@ -133,6 +193,7 @@ class WSOrderbookEngine:
     async def run(self) -> None:
         """Main event loop with auto-reconnect."""
         self._running = True
+        self._ws_loop = asyncio.get_running_loop()
 
         while self._running:
             try:
@@ -145,6 +206,8 @@ class WSOrderbookEngine:
                     url,
                     ping_interval=None,  # we handle heartbeats ourselves
                     ping_timeout=None,
+                    # 不得调大: Deribit 服务端对批量订阅强制 ~32KB 上限 (实测 ≥1200
+                    # channels/conn 即断连), 正确做法是拆分到多个连接 (见 T4 4-conn pool)
                     max_size=2**22,
                 ) as ws:
                     self._ws = ws
@@ -306,7 +369,7 @@ class WSOrderbookEngine:
         channel = params.get("channel", "")
         data = params.get("data", {})
 
-        if "ticker" not in channel:
+        if not (channel.startswith("ticker.") or channel.startswith("quote.")):
             return
 
         instrument = data.get("instrument_name", "")

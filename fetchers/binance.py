@@ -31,6 +31,7 @@ class BinanceSpotFetcher(BaseFetcher):
         interval = BINANCE_INTERVAL_MAP.get(timeframe, timeframe)
         all_data = []
         current_start = start_ts
+        now_ms = int(time.time() * 1000)
 
         while current_start < end_ts:
             params = {
@@ -55,6 +56,10 @@ class BinanceSpotFetcher(BaseFetcher):
                 break
 
             for k in data:
+                if int(k[6]) > now_ms:
+                    # 尚未走完的 K 线不落盘, 否则半周期值因尾部续拉
+                    # 从下一根开始而被永久冻结
+                    continue
                 all_data.append(OHLCV(
                     timestamp=int(k[0]),
                     open=float(k[1]),
@@ -96,6 +101,7 @@ class BinanceUSDMFetcher(BaseFetcher):
         interval = BINANCE_INTERVAL_MAP.get(timeframe, timeframe)
         all_data = []
         current_start = start_ts
+        now_ms = int(time.time() * 1000)
 
         while current_start < end_ts:
             params = {
@@ -128,6 +134,10 @@ class BinanceUSDMFetcher(BaseFetcher):
                 break
 
             for k in data:
+                if int(k[6]) > now_ms:
+                    # 尚未走完的 K 线不落盘, 否则半周期值因尾部续拉
+                    # 从下一根开始而被永久冻结
+                    continue
                 all_data.append(OHLCV(
                     timestamp=int(k[0]),
                     open=float(k[1]),

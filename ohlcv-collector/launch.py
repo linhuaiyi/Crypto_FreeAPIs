@@ -22,6 +22,15 @@ _SUBPROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 logger = get_logger("Runner", "INFO")
 
+# gapfill 内部空洞检测用的周期毫秒数; 1M 为不规则周期不参与
+TIMEFRAME_MS = {
+    "1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+    "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000, "1w": 604_800_000,
+}
+
+# 每个文件最多修补的空洞数, 防止对零成交量缺桶反复无效请求
+MAX_GAPS_PER_FILE = 50
+
 
 class DataPipeline:
     def __init__(self, config_path: str = None):
@@ -129,10 +138,10 @@ class DataPipeline:
             timeframes = [self.default_timeframe]
 
         now_ms = int(time.time() * 1000)
-        start_ms = now_ms - days * 86400 * 1000
+        target_start_ms = now_ms - days * 86400 * 1000
 
         logger.info(f"=== 历史回填模式 ===")
-        logger.info(f"时间范围: {days} 天 ({datetime.fromtimestamp(start_ms/1000)} -> {datetime.fromtimestamp(now_ms/1000)})")
+        logger.info(f"目标范围: {days} 天 ({datetime.fromtimestamp(target_start_ms/1000)} -> {datetime.fromtimestamp(now_ms/1000)})")
         logger.info(f"周期: {timeframes}")
 
         total_added = 0
@@ -146,18 +155,47 @@ class DataPipeline:
                 logger.info(f"\n--- {exchange_name} ({len(mapping)} 个标的) ---")
 
                 for unified_symbol in mapping.keys():
+                    first_ts = self.store.get_first_timestamp(exchange_name, unified_symbol, tf)
                     last_ts = self.store.get_last_timestamp(exchange_name, unified_symbol, tf)
-                    if last_ts:
-                        logger.info(f"  {unified_symbol}: 已有数据至 {datetime.fromtimestamp(last_ts/1000).date()}, 回填从 {datetime.fromtimestamp(start_ms/1000).date()} 开始")
-                    else:
-                        logger.info(f"  {unified_symbol}: 无数据，从 {datetime.fromtimestamp(start_ms/1000).date()} 开始")
 
-                    added = self._fetch_symbol(exchange_name, unified_symbol, tf, start_ms, now_ms)
-                    total_added += added
+                    ranges_to_fetch = []
+                    if first_ts is None and last_ts is None:
+                        ranges_to_fetch.append((target_start_ms, now_ms))
+                        logger.info(f"  {unified_symbol}: 无数据，采集全量")
+                    elif first_ts is None:
+                        ranges_to_fetch.append((target_start_ms, last_ts - 1))
+                        logger.info(f"  {unified_symbol}: 头部缺失，采集至 {datetime.fromtimestamp(last_ts/1000).date()}")
+                    elif last_ts is None:
+                        ranges_to_fetch.append((first_ts + 86400 * 1000, now_ms))
+                        logger.info(f"  {unified_symbol}: 尾部缺失，采集至 {datetime.fromtimestamp(first_ts/1000).date()}")
+                    else:
+                        if target_start_ms < first_ts:
+                            ranges_to_fetch.append((target_start_ms, first_ts - 1))
+                            logger.info(f"  {unified_symbol}: 头部补全 {datetime.fromtimestamp(target_start_ms/1000).date()} ~ {datetime.fromtimestamp(first_ts/1000).date()}")
+                        if last_ts < now_ms:
+                            # 尾部从下一根 K 线开始, 固定 +1 天会让分钟/小时级
+                            # 每次回填漏掉 last_ts 之后约 24h 的数据
+                            if tf == "1M":
+                                # 月线周期不规则: 从最后一桶起点整月重拉基础
+                                # 周期重采样, keep='last' 覆盖旧行; 若从
+                                # last_ts+1 天开始会漏掉月初基础 K 线, 用残缺
+                                # 桶覆盖原本正确的整月行
+                                tail_start = last_ts
+                            else:
+                                tail_start = last_ts + TIMEFRAME_MS.get(tf, 86400 * 1000)
+                            ranges_to_fetch.append((tail_start, now_ms))
+                            logger.info(f"  {unified_symbol}: 尾部补全 {datetime.fromtimestamp(last_ts/1000).date()} ~ {datetime.fromtimestamp(now_ms/1000).date()}")
+
+                    session_added = 0
+                    for start_ms, end_ms in ranges_to_fetch:
+                        added = self._fetch_symbol(exchange_name, unified_symbol, tf, start_ms, end_ms)
+                        session_added += added
+
+                    total_added += session_added
 
                     stats = self.store.get_stats(exchange_name, unified_symbol, tf)
                     if stats['exists']:
-                        logger.info(f"  {unified_symbol}: 共 {stats['count']} 条 [{datetime.fromtimestamp(stats['start_time']/1000).date()} ~ {datetime.fromtimestamp(stats['end_time']/1000).date()}]")
+                        logger.info(f"    结果: {stats['count']} 条 [{datetime.fromtimestamp(stats['start_time']/1000).date()} ~ {datetime.fromtimestamp(stats['end_time']/1000).date()}]")
 
         logger.info(f"\n=== 回填完成 ===")
         logger.info(f"总计新增: {total_added} 条记录")
@@ -183,7 +221,11 @@ class DataPipeline:
                 for unified_symbol in mapping.keys():
                     last_ts = self.store.get_last_timestamp(exchange_name, unified_symbol, tf)
                     if last_ts:
-                        fetch_start = last_ts + 86400 * 1000
+                        # 月线从最后一桶起点重拉整月, 其余从下一根开始 (同回填)
+                        if tf == "1M":
+                            fetch_start = last_ts
+                        else:
+                            fetch_start = last_ts + TIMEFRAME_MS.get(tf, 86400 * 1000)
                         if fetch_start >= now_ms:
                             logger.info(f"[{exchange_name}] {unified_symbol}: 数据已是最新，跳过")
                             continue
@@ -196,14 +238,65 @@ class DataPipeline:
         logger.info(f"\n=== 增量更新完成 ===")
         logger.info(f"总计新增: {total_added} 条记录")
 
+    def run_gapfill(self, timeframes: list[str] = None, exchanges: list[str] = None):
+        """检测已有文件头尾之间的内部空洞并补拉(回填只处理头尾缺口)。"""
+        if timeframes is None:
+            timeframes = [self.default_timeframe]
+
+        logger.info(f"=== 内部空洞修补模式 ===")
+        logger.info(f"周期: {timeframes}")
+        if exchanges:
+            logger.info(f"仅处理交易所: {exchanges}")
+
+        total_added = 0
+        for tf in timeframes:
+            interval_ms = TIMEFRAME_MS.get(tf)
+            if interval_ms is None:
+                logger.info(f"周期 {tf}: 不规则周期, 跳过空洞检测")
+                continue
+
+            for exchange_name, fetcher in self.fetchers.items():
+                if exchanges and exchange_name not in exchanges:
+                    continue
+                for unified_symbol in fetcher.get_symbol_mapping().keys():
+                    ts_list = self.store.get_timestamps(exchange_name, unified_symbol, tf)
+                    if len(ts_list) < 2:
+                        continue
+
+                    gaps = [
+                        (prev + interval_ms, curr - 1)
+                        for prev, curr in zip(ts_list, ts_list[1:])
+                        if curr - prev > interval_ms
+                    ]
+                    if not gaps:
+                        continue
+
+                    # 优先修补大空洞, 限制数量避免对零成交量缺桶反复无效请求
+                    gaps.sort(key=lambda g: g[1] - g[0], reverse=True)
+                    skipped = len(gaps) - MAX_GAPS_PER_FILE
+                    if skipped > 0:
+                        logger.warning(
+                            f"[{exchange_name}] {unified_symbol} ({tf}): "
+                            f"共 {len(gaps)} 处空洞, 仅修补最大的 {MAX_GAPS_PER_FILE} 处"
+                        )
+                        gaps = gaps[:MAX_GAPS_PER_FILE]
+
+                    logger.info(f"[{exchange_name}] {unified_symbol} ({tf}): 修补 {len(gaps)} 处内部空洞")
+                    for start_ms, end_ms in gaps:
+                        added = self._fetch_symbol(exchange_name, unified_symbol, tf, start_ms, end_ms)
+                        total_added += added
+
+        logger.info(f"\n=== 空洞修补完成 ===")
+        logger.info(f"总计新增: {total_added} 条记录")
+
 
 def main():
     parser = argparse.ArgumentParser(description='OHLCV 多级别 K 线数据采集管线')
     parser.add_argument(
         '--mode',
-        choices=['backfill', 'daily', 'single'],
+        choices=['backfill', 'daily', 'single', 'gapfill'],
         default='daily',
-        help='运行模式: backfill=历史回填, daily=每日增量, single=单标的测试'
+        help='运行模式: backfill=历史回填, daily=每日增量, single=单标的测试, gapfill=内部空洞修补'
     )
     parser.add_argument('--exchange', help='交易所名称 (single模式必需)')
     parser.add_argument('--symbol', help='标的符号 (single模式必需)')
@@ -231,6 +324,8 @@ def main():
         pipeline.run_backfill(args.days, timeframes)
     elif args.mode == 'daily':
         pipeline.run_daily(timeframes)
+    elif args.mode == 'gapfill':
+        pipeline.run_gapfill(timeframes, args.exchange.split(',') if args.exchange else None)
 
 
 if __name__ == '__main__':
