@@ -1,0 +1,27 @@
+# nautilus-collector — Binance/Hyperliquid 落盘采集（Telegram 已退役）
+# 归口 /opt/Crypto_FreeAPIs：与 deribit-options-data-collector 并列，统一数据采集入口
+# 日合并: 宿主 cron 02:15 CEST(=00:15 UTC) 跑 bin/merge_daily.py（docker run）
+services:
+  binance:
+    image: crypto-nc:base
+    container_name: nc-binance
+    restart: unless-stopped
+    environment:
+      - EXCHANGE=binance
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+  hyperliquid:
+    image: crypto-nc:base
+    container_name: nc-hyperliquid
+    restart: unless-stopped
+    environment:
+      - EXCHANGE=hyperliquid
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
