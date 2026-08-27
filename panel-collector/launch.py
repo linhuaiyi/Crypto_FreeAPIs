@@ -236,6 +236,19 @@ class PanelCollector:
                     else:
                         self._rest_gapfill(ex_name, unified, ex_sym, tf)
 
+    def _covered_dates(self, ex_name: str, unified: str, slot: str) -> set:
+        """读现有 parquet 的日期覆盖集（backfill 跳过已覆盖日，避免重拉存量）。"""
+        path = self.store._get_file_path(ex_name, unified, slot)
+        if not os.path.exists(path):
+            return set()
+        try:
+            df = pd.read_parquet(path, columns=["timestamp"])
+            if df.empty:
+                return set()
+            return set(pd.to_datetime(df["timestamp"], unit="ms").dt.date)
+        except Exception:
+            return set()
+
     def _run_ohlcv_backfill(self, days: int, only_exs: Optional[List[str]], only_syms: Optional[List[str]]):
         start_day = _utc_today() - timedelta(days=days)
         end_day = _utc_today() - timedelta(days=2)   # 已发布归档的最后一日
@@ -244,20 +257,24 @@ class PanelCollector:
             tfs = dt.get("timeframes", ["1d"])
             src = dt.get("source", "api")
             for unified, ex_sym in self._symbols_map(ex_name, only_syms).items():
-                # binance 系：vision 日档逐日回（官方终稿，无 REST 窗口限制）
+                # binance 系：vision 日档逐日回（官方终稿；每周期一次性加载已覆盖日期集，跳过存量日）
                 if src == "auto" and ex_name.startswith("binance"):
-                    d = start_day
-                    while d <= end_day:
-                        for tf in tfs:
-                            kind = "spot" if ex_name == "binance_spot" else "um"
+                    kind = "spot" if ex_name == "binance_spot" else "um"
+                    for tf in tfs:
+                        covered = self._covered_dates(ex_name, unified, tf)
+                        n_skip = 0
+                        d = start_day
+                        while d <= end_day:
+                            if d in covered:
+                                n_skip += 1; d += timedelta(days=1); continue
                             try:
                                 df = vision.download_daily_klines(ex_sym, kind, tf, d)
                                 if df is not None:
                                     self._save_ohlcv_df(ex_name, unified, ex_sym, tf, df)
                             except Exception as e:
                                 logger.warning(f"[{ex_name}] {unified} {tf} {d} vision 失败: {e}")
-                        d += timedelta(days=1)
-                    logger.info(f"[{ex_name}] {unified} vision 回补完成 {start_day}→{end_day}")
+                            d += timedelta(days=1)
+                        logger.info(f"[{ex_name}] {unified} {tf} 回补窗口 {start_day}→{end_day}（跳过已有 {n_skip} 天）")
                 # 其余所：REST 从 store 续拉（窗口有限，尽力而为）
                 else:
                     for tf in tfs:
