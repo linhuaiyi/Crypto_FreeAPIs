@@ -56,6 +56,17 @@ from utils import RateLimiter, get_logger  # noqa: E402
 logger = get_logger("PanelCollector")
 
 DATA_TYPES = ("ohlcv", "funding", "oi", "sentiment")
+# 1m → 高周期重采样规则（pandas freq；与官方高周期 zip 在绝绝大多数情况一致，差异仅极端维护窗口的桶切分）
+def _pd_notna(v):
+    try:
+        import pandas as _p
+        return _p.notna(v)
+    except Exception:
+        return v is not None
+
+
+RESAMPLE_RULES = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h",
+                  "4h": "4h", "1d": "1D", "1w": "W-MON", "1mon": "MS"}
 OHLCV_FETCHER_CLASSES = {
     "binance_spot": BinanceSpotFetcher,
     "binance_usdm": BinanceUSDMFetcher,
@@ -250,6 +261,10 @@ class PanelCollector:
             return set()
 
     def _run_ohlcv_backfill(self, days: int, only_exs: Optional[List[str]], only_syms: Optional[List[str]]):
+        """深历史补洞（2026-08-28 优化版）：
+        ① 1m：逐日 zip 攒内存，每 (交易所,符号) 一次性落盘（消灭逐日全文件重写的 O(n²)）
+        ② 高周期：不下载，从 1m 本地重采样（只补存量最早日之前的洞，不碰官方 zip 段，避免口径覆盖）
+        """
         start_day = _utc_today() - timedelta(days=days)
         end_day = _utc_today() - timedelta(days=2)   # 已发布归档的最后一日
         for ex_name in self._enabled_exchanges(only_exs):
@@ -257,25 +272,41 @@ class PanelCollector:
             tfs = dt.get("timeframes", ["1d"])
             src = dt.get("source", "api")
             for unified, ex_sym in self._symbols_map(ex_name, only_syms).items():
-                # binance 系：vision 日档逐日回（官方终稿；每周期一次性加载已覆盖日期集，跳过存量日）
                 if src == "auto" and ex_name.startswith("binance"):
                     kind = "spot" if ex_name == "binance_spot" else "um"
-                    for tf in tfs:
-                        covered = self._covered_dates(ex_name, unified, tf)
-                        n_skip = 0
+                    # ── ① 1m 批量补洞 ──
+                    if "1m" in tfs:
+                        covered = self._covered_dates(ex_name, unified, "1m")
+                        frames, n_miss = [], 0
                         d = start_day
                         while d <= end_day:
-                            if d in covered:
-                                n_skip += 1; d += timedelta(days=1); continue
-                            try:
-                                df = vision.download_daily_klines(ex_sym, kind, tf, d)
-                                if df is not None:
-                                    self._save_ohlcv_df(ex_name, unified, ex_sym, tf, df)
-                            except Exception as e:
-                                logger.warning(f"[{ex_name}] {unified} {tf} {d} vision 失败: {e}")
+                            if d not in covered:
+                                n_miss += 1
+                                try:
+                                    df = vision.download_daily_klines(ex_sym, kind, "1m", d)
+                                    if df is not None and not df.empty:
+                                        frames.append(df)
+                                except Exception as e:
+                                    logger.warning(f"[{ex_name}] {unified} 1m {d} vision 失败: {e}")
                             d += timedelta(days=1)
-                        logger.info(f"[{ex_name}] {unified} {tf} 回补窗口 {start_day}→{end_day}（跳过已有 {n_skip} 天）")
-                # 其余所：REST 从 store 续拉（窗口有限，尽力而为）
+                        if frames:
+                            import pandas as _pd
+                            alldf = _pd.concat(frames, ignore_index=True)
+                            rows = [OHLCV(timestamp=int(r["timestamp"]), open=float(r["open"]),
+                                          high=float(r["high"]), low=float(r["low"]), close=float(r["close"]),
+                                          volume=float(r.get("volume", 0.0)), quote_volume=float(r.get("quote_volume", 0.0)),
+                                          exchange=ex_name, symbol=ex_sym, timeframe="1m",
+                                          trades=int(r["trades"]) if "trades" in r and _pd.notna(r["trades"]) else None)
+                                       for _, r in alldf.iterrows()]
+                            n = self.store.save(ex_name, unified, "1m", rows)
+                            logger.info(f"[{ex_name}] {unified} 1m 批量落盘: {n_miss} 天洞/{len(rows)} 行, 新增 {n}")
+                        else:
+                            logger.info(f"[{ex_name}] {unified} 1m 无洞可补")
+                    # ── ② 高周期 = 从 1m 重采样补洞 ──
+                    for tf in tfs:
+                        if tf == "1m":
+                            continue
+                        self._resample_hole(ex_name, unified, ex_sym, tf)
                 else:
                     for tf in tfs:
                         last = self.store.get_last_timestamp(ex_name, unified, tf)
@@ -283,9 +314,44 @@ class PanelCollector:
                         if last is None or last > want:
                             self._rest_gapfill(ex_name, unified, ex_sym, tf, window_days=days)
                         else:
-                            logger.warning(
-                                f"[{ex_name}] {unified} {tf} 深洞 {datetime.fromtimestamp(last/1000, tz=timezone.utc):%F}"
-                                f" 前无归档可回，REST 窗口外缺口保留")
+                            logger.warning(f"[{ex_name}] {unified} {tf} 深洞无归档可回，REST 窗口外缺口保留")
+
+    def _resample_hole(self, ex_name: str, unified: str, ex_sym: str, tf: str):
+        """从 1m 重采样补高周期的历史洞：只处理目标周期存量最早时间戳之前的 1m 行。
+        （不碰官方高周期 zip 段，避免重采样口径覆盖官方口径；去重 keep='last' 双保险）"""
+        if tf not in RESAMPLE_RULES:
+            return
+        path_1m = self.store._get_file_path(ex_name, unified, "1m")
+        if not os.path.exists(path_1m):
+            return
+        tf_path = self.store._get_file_path(ex_name, unified, tf)
+        upper_bound = None
+        if os.path.exists(tf_path):
+            try:
+                upper_bound = int(pd.read_parquet(tf_path, columns=["timestamp"])["timestamp"].min())
+            except Exception:
+                upper_bound = None
+        df1 = pd.read_parquet(path_1m)
+        if upper_bound is not None:
+            df1 = df1[df1["timestamp"] < upper_bound]
+        if df1.empty:
+            logger.info(f"[{ex_name}] {unified} {tf} 无洞（1m 无更早数据或已被官方段覆盖）")
+            return
+        df1 = df1.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
+        dt_idx = pd.to_datetime(df1["timestamp"], unit="ms", utc=True)
+        agg = df1.set_index(dt_idx)[["open", "high", "low", "close", "volume", "quote_volume"]].resample(RESAMPLE_RULES[tf]).agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last",
+             "volume": "sum", "quote_volume": "sum"})
+        agg = agg.dropna(subset=["open"])   # 空桶不生成
+        trades = df1.set_index(dt_idx)[["trades"]].resample(RESAMPLE_RULES[tf]).sum(min_count=1)
+        rows = [OHLCV(timestamp=int(t.timestamp() * 1000), open=float(r["open"]), high=float(r["high"]),
+                      low=float(r["low"]), close=float(r["close"]), volume=float(r["volume"]),
+                      quote_volume=float(r["quote_volume"]), exchange=ex_name, symbol=ex_sym,
+                      timeframe=tf, trades=int(trades.loc[t, "trades"]) if t in trades.index and _pd_notna(trades.loc[t, "trades"]) else None)
+                for t, r in agg.iterrows()]
+        if rows:
+            n = self.store.save(ex_name, unified, tf, rows)
+            logger.info(f"[{ex_name}] {unified} {tf} 重采样补洞: {len(rows)} 桶, 新增 {n}")
 
     # ── funding ──
 
