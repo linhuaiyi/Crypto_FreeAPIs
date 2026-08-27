@@ -1,0 +1,103 @@
+# panel-collector — 统一 REST 批处理采集器（合并 ohlcv-collector + binance-data-collector）
+# 模式: daily(日频防过期) / backfill(深历史回补) / verify(自校验)
+# 合并史与去重规则见同目录 README.md
+
+global:
+  data_dir: "./panel-collector/data"
+  log_level: "INFO"
+  history_days: 365          # backfill 默认窗
+  rest_window_days: 3        # daily 模式 REST 拉取窗（容忍连续 2 天失败；Binance 1m 实测≈3 天窗）
+  max_retries: 3
+  retry_delay_seconds: 2
+
+exchanges:
+  binance_spot:
+    enabled: true
+    base_url: "https://api.binance.com/api/v3"
+    rate_limit: {requests_per_minute: 2800}
+    symbols:                 # 14 符号横截面面板（继承 ohlcv-collector 已验证映射）
+      BTC: "BTCUSDT"
+      ETH: "ETHUSDT"
+      SOL: "SOLUSDT"
+      BNB: "BNBUSDT"
+      XRP: "XRPUSDT"
+      ADA: "ADAUSDT"
+      DOGE: "DOGEUSDT"
+      SHIB: "SHIBUSDT"
+      PEPE: "PEPEUSDT"
+      WIF: "WIFUSDT"
+      BONK: "BONKUSDT"
+      FLOKI: "FLOKIUSDT"
+      LINK: "LINKUSDT"
+      AVAX: "AVAXUSDT"
+    data_types:
+      ohlcv: {enabled: true, source: auto, timeframes: [1m, 15m, 30m, 1h, 4h, 1d, 1w]}
+      # source=auto: 深历史(backfill)与 daily 1m 走 data.binance.vision 官方归档，其余走 REST
+
+  binance_usdm:
+    enabled: true
+    base_url: "https://fapi.binance.com"
+    rate_limit: {requests_per_minute: 100}
+    symbols:                 # 合约面板 11 符号（继承 oc；SHIB/PEPE/BONK/FLOKI 当年无合约，加新币改这里）
+      BTC: "BTCUSDT"
+      ETH: "ETHUSDT"
+      SOL: "SOLUSDT"
+      BNB: "BNBUSDT"
+      XRP: "XRPUSDT"
+      ADA: "ADAUSDT"
+      DOGE: "DOGEUSDT"
+      WIF: "WIFUSDT"
+      LINK: "LINKUSDT"
+      AVAX: "AVAXUSDT"
+    data_types:
+      ohlcv:     {enabled: true, source: auto, timeframes: [1m, 15m, 30m, 1h, 4h, 1d, 1w]}
+      funding:   {enabled: true, source: auto}   # auto: 深历史走 vision 月档，daily 走 REST
+      oi:        {enabled: true, source: api, period: 1d}    # ⚠ openInterestHist 仅保留 ~30 天，过期即焚 → daily 必跑
+      sentiment: {enabled: true, source: api, period: 1d}    # ⚠ topLongShort/takerRatio 同 30 天窗
+
+  deribit:
+    enabled: true
+    base_url: "https://www.deribit.com/api/v2"
+    rate_limit: {requests_per_second: 15}
+    symbols:
+      BTC: "BTC-PERPETUAL"
+      ETH: "ETH-PERPETUAL"
+      SOL: "SOL-PERPETUAL"
+    data_types:
+      ohlcv: {enabled: true, source: api, timeframes: [1h, 4h, 1d]}
+      # funding 不采（去重规则）：湖内真源 = raw.deribit.funding_rate（v2 采集器，2026-08-10→）
+
+  hyperliquid:
+    enabled: true
+    base_url: "https://api.hyperliquid.xyz"
+    rate_limit: {requests_per_minute: 120}   # candleSnapshot 权重高，1000rpm 持续 429（oc 实测教训）
+    symbols:
+      BTC: "BTC"
+      ETH: "ETH"
+      SOL: "SOL"
+      XRP: "XRP"
+      ADA: "ADA"
+      DOGE: "DOGE"
+      WIF: "WIF"
+      LINK: "LINK"
+      AVAX: "AVAX"
+      PEPE: "kPEPE"
+      BONK: "kBONK"
+      SHIB: "kSHIB"
+      FLOKI: "kFLOKI"
+    data_types:
+      ohlcv:   {enabled: true, source: api, timeframes: [1m, 15m, 30m, 1h, 4h, 1d, 1w]}   # ⚠ 无公开归档，daily 必跑
+      funding: {enabled: true, source: api}   # ⚠ API 窗口有限（约30天），daily 必跑
+
+vision:
+  base: "https://data.binance.vision"
+  http_timeout_sec: 60
+  max_retries: 3
+  inter_request_delay_ms: 50   # CDN politeness
+
+metrics_api:                   # binance_usdm 指标族（oi/sentiment）
+  base: "https://fapi.binance.com/futures/data"
+  http_timeout_sec: 30
+
+verify:
+  max_age_hours: {ohlcv: 48, funding: 26, oi: 48, sentiment: 48}   # 新鲜度阈值（verify 模式判 STALE 用）
