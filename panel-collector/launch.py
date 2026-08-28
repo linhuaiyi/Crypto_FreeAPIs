@@ -239,6 +239,11 @@ class PanelCollector:
             src = self.config["exchanges"][ex_name]["data_types"]["ohlcv"].get("source", "api")
             for unified, ex_sym in self._symbols_map(ex_name, only_syms).items():
                 for tf in tfs:
+                    # 1w/1mon 走循环后的本地重采样,不进网络路径:
+                    # oc fetcher"未收桶不落盘"(正确规则)+周/月桶收盘在未来
+                    # → 网络路径永远 0 条(2026-08-28 三层排障实测)
+                    if tf in ("1w", "1mon") and (ex_name.startswith("binance") or ex_name == "hyperliquid"):
+                        continue
                     # binance 系 source=auto：全周期走 vision T-1 官方终稿日档
                     # （实测教训 2026-08-27：fapi klines REST 对本机 403，vision CDN 无区域限制；
                     #   现货 REST 虽通也统一走归档，保证官方终稿口径）
@@ -254,6 +259,43 @@ class PanelCollector:
                             self._rest_gapfill(ex_name, unified, ex_sym, tf)
                     else:
                         self._rest_gapfill(ex_name, unified, ex_sym, tf)
+                # 周线/月线：从库内 1d 本地重采样(W-MON/自然月锚,丢未收桶;keep='last' 自愈)
+                if ex_name.startswith("binance") or ex_name == "hyperliquid":
+                    self._refresh_resampled(ex_name, unified, ex_sym)
+
+    def _refresh_resampled(self, ex_name: str, unified: str, ex_sym: str):
+        """每日从 1d 重建 1w/1mon(仅已收桶)。不依赖 API 窗口与未收桶过滤,比网络路径可靠。"""
+        import pandas as _pd
+        p = self.store._get_file_path(ex_name, unified, "1d")
+        if not os.path.exists(p):
+            return
+        df = _pd.read_parquet(p)
+        if df.empty:
+            return
+        df = df.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
+        idx = _pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        base = df.set_index(idx)[["open", "high", "low", "close", "volume", "quote_volume"]]
+        trades = df.set_index(idx)[["trades"]]
+        now = _pd.Timestamp.now(tz="UTC")
+        for tf, rule, off in (("1w", "W-MON", _pd.Timedelta(days=7)),
+                              ("1mon", "MS", _pd.tseries.offsets.MonthBegin(1))):
+            agg = base.resample(rule).agg({"open": "first", "high": "max", "low": "min",
+                                           "close": "last", "volume": "sum", "quote_volume": "sum"})
+            tr = trades.resample(rule).sum(min_count=1)
+            agg = agg.dropna(subset=["open"])
+            rows = []
+            for t, r in agg.iterrows():
+                if t + off > now:      # 未收桶丢弃(与 fetcher 防冻结语义一致)
+                    continue
+                rows.append(OHLCV(timestamp=int(t.timestamp() * 1000), open=float(r["open"]),
+                                  high=float(r["high"]), low=float(r["low"]), close=float(r["close"]),
+                                  volume=float(r["volume"]), quote_volume=float(r["quote_volume"]),
+                                  exchange=ex_name, symbol=ex_sym, timeframe=tf,
+                                  trades=int(tr.loc[t, "trades"]) if t in tr.index and _pd.notna(tr.loc[t, "trades"]) else None))
+            if rows:
+                n = self.store.save(ex_name, unified, tf, rows)
+                if n:
+                    logger.info(f"[{ex_name}] {unified} {tf} 重采样刷新: {len(rows)} 桶, 新增/更新 {n}")
 
     def _covered_dates(self, ex_name: str, unified: str, slot: str) -> set:
         """读现有 parquet 的日期覆盖集（backfill 跳过已覆盖日，避免重拉存量）。"""
