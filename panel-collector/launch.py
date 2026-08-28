@@ -195,7 +195,7 @@ class PanelCollector:
                 low=float(r["low"]), close=float(r["close"]),
                 volume=float(r.get("volume", 0.0)),
                 quote_volume=float(r.get("quote_volume", 0.0)),
-                exchange=ex_name, symbol=ex_sym, timeframe=tf,
+                exchange=ex_name, symbol=unified, timeframe=tf,
                 trades=int(r["trades"]) if "trades" in r and pd.notna(r["trades"]) else None,
             )
             for _, r in df.iterrows()
@@ -239,11 +239,7 @@ class PanelCollector:
             src = self.config["exchanges"][ex_name]["data_types"]["ohlcv"].get("source", "api")
             for unified, ex_sym in self._symbols_map(ex_name, only_syms).items():
                 for tf in tfs:
-                    # 1w/1mon 走循环后的本地重采样,不进网络路径:
-                    # oc fetcher"未收桶不落盘"(正确规则)+周/月桶收盘在未来
-                    # → 网络路径永远 0 条(2026-08-28 三层排障实测)
-                    if tf in ("1w", "1mon") and (ex_name.startswith("binance") or ex_name == "hyperliquid"):
-                        continue
+                    # 1w/1mon: vision 无此二档(404 实测)→REST 已收桶直采(复验可行,用户拍板采集优先)
                     # binance 系 source=auto：全周期走 vision T-1 官方终稿日档
                     # （实测教训 2026-08-27：fapi klines REST 对本机 403，vision CDN 无区域限制；
                     #   现货 REST 虽通也统一走归档，保证官方终稿口径）
@@ -259,9 +255,6 @@ class PanelCollector:
                             self._rest_gapfill(ex_name, unified, ex_sym, tf)
                     else:
                         self._rest_gapfill(ex_name, unified, ex_sym, tf)
-                # 周线/月线：从库内 1d 本地重采样(W-MON/自然月锚,丢未收桶;keep='last' 自愈)
-                if ex_name.startswith("binance") or ex_name == "hyperliquid":
-                    self._refresh_resampled(ex_name, unified, ex_sym)
 
     def _refresh_resampled(self, ex_name: str, unified: str, ex_sym: str):
         """每日从 1d 重建 1w/1mon(仅已收桶)。不依赖 API 窗口与未收桶过滤,比网络路径可靠。"""
@@ -290,7 +283,7 @@ class PanelCollector:
                 rows.append(OHLCV(timestamp=int(t.timestamp() * 1000), open=float(r["open"]),
                                   high=float(r["high"]), low=float(r["low"]), close=float(r["close"]),
                                   volume=float(r["volume"]), quote_volume=float(r["quote_volume"]),
-                                  exchange=ex_name, symbol=ex_sym, timeframe=tf,
+                                  exchange=ex_name, symbol=unified, timeframe=tf,
                                   trades=int(tr.loc[t, "trades"]) if t in tr.index and _pd.notna(tr.loc[t, "trades"]) else None))
             if rows:
                 n = self.store.save(ex_name, unified, tf, rows)
@@ -324,6 +317,10 @@ class PanelCollector:
             for unified, ex_sym in self._symbols_map(ex_name, only_syms).items():
                 if src == "auto" and ex_name.startswith("binance"):
                     kind = "spot" if ex_name == "binance_spot" else "um"
+                    # ── ⓪ 1w/1mon: vision 无档 → REST 已收桶全史直采 ──
+                    for tf in tfs:
+                        if tf in ("1w", "1mon"):
+                            self._rest_gapfill(ex_name, unified, ex_sym, tf, window_days=days)
                     # ── ① 1m 批量补洞 ──
                     if "1m" in tfs:
                         covered = self._covered_dates(ex_name, unified, "1m")
@@ -345,7 +342,7 @@ class PanelCollector:
                             rows = [OHLCV(timestamp=int(r["timestamp"]), open=float(r["open"]),
                                           high=float(r["high"]), low=float(r["low"]), close=float(r["close"]),
                                           volume=float(r.get("volume", 0.0)), quote_volume=float(r.get("quote_volume", 0.0)),
-                                          exchange=ex_name, symbol=ex_sym, timeframe="1m",
+                                          exchange=ex_name, symbol=unified, timeframe="1m",
                                           trades=int(r["trades"]) if "trades" in r and _pd.notna(r["trades"]) else None)
                                        for _, r in alldf.iterrows()]
                             n = self.store.save(ex_name, unified, "1m", rows)
@@ -396,7 +393,7 @@ class PanelCollector:
         trades = df1.set_index(dt_idx)[["trades"]].resample(RESAMPLE_RULES[tf]).sum(min_count=1)
         rows = [OHLCV(timestamp=int(t.timestamp() * 1000), open=float(r["open"]), high=float(r["high"]),
                       low=float(r["low"]), close=float(r["close"]), volume=float(r["volume"]),
-                      quote_volume=float(r["quote_volume"]), exchange=ex_name, symbol=ex_sym,
+                      quote_volume=float(r["quote_volume"]), exchange=ex_name, symbol=unified,
                       timeframe=tf, trades=int(trades.loc[t, "trades"]) if t in trades.index and _pd_notna(trades.loc[t, "trades"]) else None)
                 for t, r in agg.iterrows()]
         if rows:
