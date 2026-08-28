@@ -44,3 +44,8 @@ python3 panel-collector/launch.py verify     # 自校验，退出码 1 = 有 MIS
 
 - `../ohlcv-collector/`：2025-10-18→2026-08-16 十个月横截面（2.5G，frozen）
 - `../binance-data-collector/`：2026-04→07 vision 归档（53M，tool，被本工具取代）
+
+## VPS 三层铁律（2026-08-28）
+
+代码变更=部署逐次批准；**VPS 数据只读，禁止推数据上 VPS/在 VPS 处理数据**；处理一律湖侧。
+1w/1mon 教训：vision 无此二档→REST 已收桶直采（勿重采样，用户拍板）；symbol 列必须统一 unified（去重键跨源生效）。
