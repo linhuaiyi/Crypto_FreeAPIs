@@ -23,7 +23,8 @@ python3 panel-collector/launch.py verify     # 自校验，退出码 1 = 有 MIS
 ## 实测教训（2026-08-27 首跑）
 
 1. **fapi klines REST 对本机 403**（区域性封锁；同域的 fundingRate/指标族反而通）——所以 binance 系 K 线一律走 vision CDN，REST 仅兜底
-2. **vision T-1 日档在 UTC 03:14 尚未发布**——daily cron 须排 **≥05:00 UTC**（如本地 13:00+），或接受当天靠 REST 窗口
+2. **vision T-1 日档在 UTC 03:14 尚未发布**——VPS cron 排 **08:10 Berlin（=06:10 UTC）**；⚠ VPS crontab 是 Berlin 时间，别按 UTC 排（踩过：05:10 Berlin=03:10 UTC 过早）
+3. usdm base_url 必须含 `/fapi/v1`（截断=REST 兜底 403，曾误判为区域封锁）
 3. Binance 指标族时间戳**本来就是毫秒**（首次实现误乘 1000 已修）；taker 端点字段是 `buySellRatio` 非 `longShortRatio`
 4. 裸请求交易所必带 UA（403/451 假象）——已在 Session 层统一设置
 
