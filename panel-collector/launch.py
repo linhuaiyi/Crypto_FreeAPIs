@@ -212,7 +212,13 @@ class PanelCollector:
         """REST 增量：从 store 最后时间戳续到 now；窗口外的深洞留给 backfill。"""
         fetcher = self.ohlcv_fetchers[ex_name]
         now = _now_ms()
-        start = now - int(window_days or self.rest_window_days) * 86400_000
+        wd = int(window_days or self.rest_window_days)
+        # 长周期桶(周/月)的 openTime 在窗口外会被 API 空返回——回看窗按桶跨度放宽
+        if tf == "1w":
+            wd = max(wd, 10)
+        elif tf == "1mon":
+            wd = max(wd, 35)
+        start = now - wd * 86400_000
         last = self.store.get_last_timestamp(ex_name, unified, tf)
         if last:
             start = max(start, last + 1)
@@ -520,6 +526,11 @@ class PanelCollector:
         last = int(df["timestamp"].max())
         age_h = (now - last) / 3600_000
         limit = float(max_age.get(dtype, 48))
+        if slot == "1w":
+            limit = max(limit, 8 * 24)      # 周线最后完整桶最多 7 天前
+        elif slot == "1mon":
+            limit = max(limit, 35 * 24)     # 月线同理
+
         status = "✅" if age_h <= limit else f"⚠ STALE({age_h:.0f}h)"
         ts = datetime.fromtimestamp(last / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
         report.append(f"{ex_name}/{unified}/{slot:8s} {len(df):>8d} {ts:>20s} {status}")
