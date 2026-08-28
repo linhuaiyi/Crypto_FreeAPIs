@@ -36,7 +36,7 @@ exchanges:
 
   binance_usdm:
     enabled: true
-    base_url: "https://fapi.binance.com"
+    base_url: "https://fapi.binance.com/fapi/v1"
     rate_limit: {requests_per_minute: 100}
     symbols:                 # 合约面板 11 符号（继承 oc；SHIB/PEPE/BONK/FLOKI 当年无合约，加新币改这里）
       BTC: "BTCUSDT"
