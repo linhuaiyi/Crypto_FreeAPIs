@@ -399,7 +399,6 @@ class PanelCollector:
                     m = (m + timedelta(days=32)).replace(day=1)
                 # 当月尾巴用 REST 收口
                 self._run_funding_daily(only_syms)
-                return
         # 其他所：REST 尽力（窗口有限）
         self._run_funding_daily(only_syms)
 
