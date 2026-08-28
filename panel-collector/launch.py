@@ -566,9 +566,9 @@ class PanelCollector:
         age_h = (now - last) / 3600_000
         limit = float(max_age.get(dtype, 48))
         if slot == "1w":
-            limit = max(limit, 8 * 24)      # 周线最后完整桶最多 7 天前
+            limit = max(limit, 15 * 24)     # 周桶 age 从开盘起算,最老 ~14d(周日临收口时)
         elif slot == "1mon":
-            limit = max(limit, 35 * 24)     # 月线同理
+            limit = max(limit, 62 * 24)     # 月桶同理,月末临收口时最老 ~61d
 
         status = "✅" if age_h <= limit else f"⚠ STALE({age_h:.0f}h)"
         ts = datetime.fromtimestamp(last / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
