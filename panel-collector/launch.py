@@ -65,6 +65,8 @@ def _pd_notna(v):
         return v is not None
 
 
+API_INTERVAL = {"1mon": "1M"}   # 文件槽位用 1mon(承 oc 布局),API 参数用 1M(binance/HL 同规)
+
 RESAMPLE_RULES = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h",
                   "4h": "4h", "1d": "1D", "1w": "W-MON", "1mon": "MS"}
 OHLCV_FETCHER_CLASSES = {
@@ -217,7 +219,7 @@ class PanelCollector:
         if start >= now:
             return 0
         try:
-            records = fetcher.fetch_with_backoff(ex_sym, tf, start, now)
+            records = fetcher.fetch_with_backoff(ex_sym, API_INTERVAL.get(tf, tf), start, now)
         except Exception as e:  # 单流失败不拖垮面板
             logger.error(f"[{ex_name}] {unified} {tf} REST 失败: {e}")
             return 0
@@ -237,7 +239,7 @@ class PanelCollector:
                     if src == "auto" and ex_name.startswith("binance"):
                         try:
                             kind = "spot" if ex_name == "binance_spot" else "um"
-                            df = vision.download_daily_klines(ex_sym, kind, tf, t1)
+                            df = vision.download_daily_klines(ex_sym, kind, API_INTERVAL.get(tf, tf), t1)
                             n = self._save_ohlcv_df(ex_name, unified, ex_sym, tf, df) if df is not None else 0
                             if n == 0:
                                 self._rest_gapfill(ex_name, unified, ex_sym, tf)
